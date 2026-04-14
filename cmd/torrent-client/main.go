@@ -13,6 +13,7 @@ import (
 	"torrent-client/internal/dht"
 	"torrent-client/internal/downloader"
 	peerpkg "torrent-client/internal/peer"
+	"torrent-client/internal/portmap"
 	"torrent-client/internal/protocol"
 	"torrent-client/internal/tracker"
 	"torrent-client/internal/types"
@@ -32,8 +33,9 @@ func main() {
 	quiet := fs.Bool("quiet", false, "suppress downloader progress/stats output")
 	verbose := fs.Bool("verbose", false, "force verbose downloader progress/stats output")
 	listenPort := fs.Uint("listen-port", 6881, "tcp port to announce and listen on")
+	enableNAT := fs.Bool("enable-nat", true, "enable UPnP/NAT-PMP port mapping")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: torrent-client [--quiet|--verbose] [--listen-port <port>] <path-to-torrent-file-or-magnet-link>\n")
+		fmt.Fprintf(fs.Output(), "Usage: torrent-client [--quiet|--verbose] [--listen-port <port>] [--enable-nat] <path-to-torrent-file-or-magnet-link>\n")
 		fs.PrintDefaults()
 	}
 
@@ -65,6 +67,32 @@ func main() {
 	var downloadedBytes atomic.Int64
 	var uploadedBytes atomic.Int64
 	var leftBytes atomic.Int64
+	var externalIP string
+	var mapper *portmap.Mapper
+
+	// Try to map port with UPnP/NAT-PMP for better reachability
+	if *enableNAT {
+		if m, err := portmap.NewMapper(3 * time.Second); err == nil {
+			if eip, _, err := m.MapPort(uint16(*listenPort)); err == nil {
+				externalIP = eip
+				mapper = m
+				if *verbose {
+					fmt.Printf("NAT mapping successful (%s): external IP=%s port=%d\n", m.Protocol(), externalIP, *listenPort)
+				}
+			} else if *verbose {
+				fmt.Printf("NAT mapping failed: %v\n", err)
+			}
+		} else if *verbose {
+			fmt.Printf("NAT discovery skipped: %v\n", err)
+		}
+	}
+
+	// Cleanup NAT mapping on exit
+	defer func() {
+		if mapper != nil {
+			_ = mapper.UnmapPort(uint16(*listenPort))
+		}
+	}()
 
 	var torrentFile *types.TorrentFile
 	var peers []types.Peer

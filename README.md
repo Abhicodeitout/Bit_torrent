@@ -30,6 +30,7 @@ A fully functional, production-ready BitTorrent client written in Go — support
 | Adaptive peer scheduling | ✅ | Peer scoring, backoff, temporary quarantine |
 | Continuous peer discovery | ✅ | Trackers + DHT queried during active download |
 | Inbound peer listener | ✅ | Configurable listen port for incoming peer handshakes |
+| UPnP/NAT-PMP port mapping | ✅ | Automatic external reachability via gateway mapping |
 | Tracker lifecycle events | ✅ | `started`, periodic announce, `completed`, `stopped` |
 | Basic upload serving | ✅ | Serves available pieces to inbound peers via request/piece messages |
 | Tracker progress counters | ✅ | Announces live `downloaded`, `left`, and `uploaded` values |
@@ -80,6 +81,7 @@ Optional runtime flags:
 ./bin/torrent-client --quiet path/to/file.torrent
 ./bin/torrent-client --verbose path/to/file.torrent
 ./bin/torrent-client --listen-port 51413 path/to/file.torrent
+./bin/torrent-client --enable-nat=false path/to/file.torrent   # disable port mapping
 ```
 
 **Example:**
