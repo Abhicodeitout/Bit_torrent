@@ -33,6 +33,7 @@ A fully functional, production-ready BitTorrent client written in Go — support
 | Tracker lifecycle events | ✅ | `started`, periodic announce, `completed`, `stopped` |
 | Basic upload serving | ✅ | Serves available pieces to inbound peers via request/piece messages |
 | Tracker progress counters | ✅ | Announces live `downloaded`, `left`, and `uploaded` values |
+| Discovery retries/fallbacks | ✅ | Multi-round tracker announces + DHT rounds + peer dedupe |
 | Rarest-first + endgame mode | ✅ | Better swarm efficiency and tail completion |
 | Concurrent downloading | ✅ | Configured worker pool with long-lived peer sessions |
 | Runtime telemetry | ✅ | Piece/peer stats during download, toggleable |
@@ -97,6 +98,12 @@ Optional runtime flags:
 7. Continue peer discovery in the background while downloading
 8. SHA-1 verify every piece, write directly to output offsets, and persist state
 9. Enter endgame mode near completion to finish tail pieces faster
+
+Notes:
+
+- Non-private torrents automatically include a curated public UDP tracker fallback list.
+- Startup discovery uses multiple tracker rounds with retries and deduplicates discovered peers.
+- Runtime discovery repeats tracker announces and DHT rounds to continually refresh the peer pool.
 
 ---
 

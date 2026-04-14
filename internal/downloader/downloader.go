@@ -21,6 +21,15 @@ import (
 	"torrent-client/internal/types"
 )
 
+var publicTrackerFallback = []string{
+	"udp://tracker.opentrackr.org:1337/announce",
+	"udp://open.stealth.si:80/announce",
+	"udp://tracker.torrent.eu.org:451/announce",
+	"udp://exodus.desync.com:6969/announce",
+	"udp://tracker.openbittorrent.com:6969/announce",
+	"udp://tracker.dler.org:6969/announce",
+}
+
 const (
 	blockSize    = 16 * 1024 // 16 KB
 	numGoroutine = 10
@@ -1147,6 +1156,12 @@ func buildTrackerList(tf *types.TorrentFile) []string {
 			add(tr)
 		}
 	}
+
+	if !tf.Info.Private {
+		for _, tr := range publicTrackerFallback {
+			add(tr)
+		}
+	}
 	return list
 }
 
@@ -1253,6 +1268,34 @@ func setBitfieldPiece(bitfield *[]byte, pieceIdx int) {
 }
 
 func discoveryLoop(ctx context.Context, torrent *types.TorrentFile, trackers []string, peerID [20]byte, listenPort uint16, addPeer func(types.Peer)) {
+	announceWithRetry := func(tr string, req tracker.AnnounceRequest) []types.Peer {
+		const retries = 2
+		var lastErr error
+		for attempt := 0; attempt < retries; attempt++ {
+			switch {
+			case strings.HasPrefix(tr, "udp://"):
+				pp, err := tracker.AnnounceUDPWithRequest(tr, req)
+				if err == nil {
+					return pp
+				}
+				lastErr = err
+			case strings.HasPrefix(tr, "http://"), strings.HasPrefix(tr, "https://"):
+				tfCopy := *torrent
+				tfCopy.Announce = tr
+				pp, err := tracker.AnnounceToHTTPTrackerWithRequest(&tfCopy, req)
+				if err == nil {
+					return pp
+				}
+				lastErr = err
+			}
+			time.Sleep(time.Duration(attempt+1) * 350 * time.Millisecond)
+		}
+		if lastErr != nil {
+			return nil
+		}
+		return nil
+	}
+
 	fetch := func() {
 		for _, tr := range trackers {
 			select {
@@ -1261,43 +1304,25 @@ func discoveryLoop(ctx context.Context, torrent *types.TorrentFile, trackers []s
 			default:
 			}
 
-			switch {
-			case strings.HasPrefix(tr, "udp://"):
-				pp, err := tracker.AnnounceUDPWithRequest(tr, tracker.AnnounceRequest{
-					InfoHash: torrent.InfoHash,
-					PeerID:   peerID,
-					Port:     listenPort,
-					Left:     torrent.Info.Length,
-					Event:    "",
-				})
-				if err == nil {
-					for _, p := range pp {
-						addPeer(p)
-					}
-				}
-			case strings.HasPrefix(tr, "http://"), strings.HasPrefix(tr, "https://"):
-				tfCopy := *torrent
-				tfCopy.Announce = tr
-				pp, err := tracker.AnnounceToHTTPTrackerWithRequest(&tfCopy, tracker.AnnounceRequest{
-					InfoHash: torrent.InfoHash,
-					PeerID:   peerID,
-					Port:     listenPort,
-					Left:     torrent.Info.Length,
-					Event:    "",
-				})
-				if err == nil {
-					for _, p := range pp {
-						addPeer(p)
-					}
-				}
+			pp := announceWithRetry(tr, tracker.AnnounceRequest{
+				InfoHash: torrent.InfoHash,
+				PeerID:   peerID,
+				Port:     listenPort,
+				Left:     torrent.Info.Length,
+				Event:    "",
+			})
+			for _, p := range pp {
+				addPeer(p)
 			}
 		}
 
 		if !torrent.Info.Private {
-			pp, err := dht.GetPeers(torrent.InfoHash, 120, 20*time.Second)
-			if err == nil {
-				for _, p := range pp {
-					addPeer(p)
+			for i := 0; i < 2; i++ {
+				pp, err := dht.GetPeers(torrent.InfoHash, 120, 20*time.Second)
+				if err == nil {
+					for _, p := range pp {
+						addPeer(p)
+					}
 				}
 			}
 		}

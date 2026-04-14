@@ -27,6 +27,21 @@ type AnnounceRequest struct {
 	Event      string // "started", "completed", "stopped", or ""
 }
 
+type httpTrackerPeer struct {
+	IP   string `bencode:"ip"`
+	Port int64  `bencode:"port"`
+}
+
+type httpTrackerResponseCompact struct {
+	FailureReason string `bencode:"failure reason"`
+	Peers         string `bencode:"peers"`
+}
+
+type httpTrackerResponseList struct {
+	FailureReason string            `bencode:"failure reason"`
+	Peers         []httpTrackerPeer `bencode:"peers"`
+}
+
 func udpEventCode(event string) uint32 {
 	switch event {
 	case "completed":
@@ -199,39 +214,33 @@ func AnnounceToHTTPTrackerWithRequest(torrent *types.TorrentFile, req AnnounceRe
 		return nil, fmt.Errorf("failed to read HTTP tracker response: %v", err)
 	}
 
-	// Parse the bencode response
-	var response map[string]interface{}
-	reader := bytes.NewReader(body)
-	err = bencode.Unmarshal(reader, &response)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse tracker response: %v", err)
-	}
-
-	// Check for error message
-	if errorMsg, ok := response["failure reason"].(string); ok {
-		return nil, fmt.Errorf("tracker error: %s", errorMsg)
-	}
-
-	// Parse peers
 	var peers []types.Peer
 
-	// Try compact format first
-	if peersStr, ok := response["peers"].(string); ok {
-		peers = ParsePeersCompact([]byte(peersStr))
-	} else if peersList, ok := response["peers"].([]interface{}); ok {
-		// Dictionary format
-		for _, p := range peersList {
-			if peerMap, ok := p.(map[string]interface{}); ok {
-				if ipStr, ok := peerMap["ip"].(string); ok {
-					if port, ok := peerMap["port"].(int64); ok {
-						ip := net.ParseIP(ipStr)
-						peers = append(peers, types.Peer{
-							IP:   ip,
-							Port: uint16(port),
-						})
-					}
-				}
+	// Try compact format first (most trackers when compact=1).
+	var compactResp httpTrackerResponseCompact
+	if err := bencode.Unmarshal(bytes.NewReader(body), &compactResp); err == nil {
+		if compactResp.FailureReason != "" {
+			return nil, fmt.Errorf("tracker error: %s", compactResp.FailureReason)
+		}
+		if compactResp.Peers != "" {
+			peers = ParsePeersCompact([]byte(compactResp.Peers))
+		}
+	}
+
+	if len(peers) == 0 {
+		var listResp httpTrackerResponseList
+		if err := bencode.Unmarshal(bytes.NewReader(body), &listResp); err != nil {
+			return nil, fmt.Errorf("failed to parse tracker response: %v", err)
+		}
+		if listResp.FailureReason != "" {
+			return nil, fmt.Errorf("tracker error: %s", listResp.FailureReason)
+		}
+		for _, p := range listResp.Peers {
+			ip := net.ParseIP(p.IP)
+			if ip == nil || p.Port <= 0 || p.Port > 65535 {
+				continue
 			}
+			peers = append(peers, types.Peer{IP: ip, Port: uint16(p.Port)})
 		}
 	}
 

@@ -6,11 +6,31 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"os"
-	"strings"
 	"net/url"
+	"strings"
 
 	bencode "github.com/jackpal/bencode-go"
 )
+
+type bencodeTorrent struct {
+	Announce     string     `bencode:"announce"`
+	AnnounceList [][]string `bencode:"announce-list"`
+	Info         bencodeInfo `bencode:"info"`
+}
+
+type bencodeInfo struct {
+	Name        string       `bencode:"name"`
+	PieceLength int64        `bencode:"piece length"`
+	Pieces      string       `bencode:"pieces"`
+	Length      int64        `bencode:"length"`
+	Files       []bencodeFile `bencode:"files"`
+	Private     int64        `bencode:"private"`
+}
+
+type bencodeFile struct {
+	Length int64    `bencode:"length"`
+	Path   []string `bencode:"path"`
+}
 
 // GeneratePeerID creates a unique 20-byte peer ID for the client.
 func GeneratePeerID() [20]byte {
@@ -28,45 +48,19 @@ func OpenTorrentFile(filePath string) (*TorrentFile, error) {
 	}
 	defer file.Close()
 
-	var raw map[string]interface{}
+	var raw bencodeTorrent
 	err = bencode.Unmarshal(file, &raw)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse torrent file: %v", err)
 	}
 
 	torrent := &TorrentFile{}
-
-	// Parse announce
-	if announce, ok := raw["announce"].(string); ok {
-		torrent.Announce = announce
-	}
-
-	// Parse announce-list (tier list)
-	if announceList, ok := raw["announce-list"].([]interface{}); ok {
-		for _, tier := range announceList {
-			if tierList, ok := tier.([]interface{}); ok {
-				var tierAnnounces []string
-				for _, announce := range tierList {
-					if announceStr, ok := announce.(string); ok {
-						tierAnnounces = append(tierAnnounces, announceStr)
-					}
-				}
-				if len(tierAnnounces) > 0 {
-					torrent.AnnounceList = append(torrent.AnnounceList, tierAnnounces)
-				}
-			}
-		}
-	}
-
-	// Parse info dictionary
-	infoRaw, ok := raw["info"].(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("missing or invalid 'info' field in torrent")
-	}
+	torrent.Announce = raw.Announce
+	torrent.AnnounceList = raw.AnnounceList
 
 	// Calculate info hash by re-encoding the info dict
 	infoEncoded := new(bytes.Buffer)
-	err = bencode.Marshal(infoEncoded, infoRaw)
+	err = bencode.Marshal(infoEncoded, raw.Info)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode info dict: %v", err)
 	}
@@ -74,55 +68,36 @@ func OpenTorrentFile(filePath string) (*TorrentFile, error) {
 	hash := sha1.Sum(torrent.RawInfo)
 	torrent.InfoHash = hash
 
-	// Parse piece length
-	if pieceLength, ok := infoRaw["piece length"].(int64); ok {
-		torrent.Info.PieceLength = pieceLength
-	}
-
-	if name, ok := infoRaw["name"].(string); ok {
-		torrent.Info.Name = name
-	}
-
-	if privateFlag, ok := infoRaw["private"].(int64); ok && privateFlag == 1 {
+	torrent.Info.PieceLength = raw.Info.PieceLength
+	torrent.Info.Name = raw.Info.Name
+	if raw.Info.Private == 1 {
 		torrent.Info.Private = true
 	}
 
 	// Parse pieces (concatenated 20-byte hashes)
-	if pieces, ok := infoRaw["pieces"].(string); ok {
-		for i := 0; i < len(pieces); i += 20 {
-			if i+20 <= len(pieces) {
-				var hash [20]byte
-				copy(hash[:], pieces[i:i+20])
-				torrent.Info.PieceHashes = append(torrent.Info.PieceHashes, hash)
-			}
+	for i := 0; i < len(raw.Info.Pieces); i += 20 {
+		if i+20 <= len(raw.Info.Pieces) {
+			var h [20]byte
+			copy(h[:], raw.Info.Pieces[i:i+20])
+			torrent.Info.PieceHashes = append(torrent.Info.PieceHashes, h)
 		}
 	}
 
 	// Parse file information
-	if length, ok := infoRaw["length"].(int64); ok {
-		// Single file torrent
-		torrent.Info.Length = length
-	} else if files, ok := infoRaw["files"].([]interface{}); ok {
-		// Multi-file torrent
-		for _, f := range files {
-			if fileMap, ok := f.(map[string]interface{}); ok {
-				if length, ok := fileMap["length"].(int64); ok {
-					torrent.Info.Length += length
-					if pathList, ok := fileMap["path"].([]interface{}); ok {
-						var pathStr []string
-						for _, p := range pathList {
-							if pStr, ok := p.(string); ok {
-								pathStr = append(pathStr, pStr)
-							}
-						}
-						torrent.Info.Files = append(torrent.Info.Files, FileInfo{
-							Length: length,
-							Path:   pathStr,
-						})
-					}
-				}
-			}
+	if len(raw.Info.Files) == 0 {
+		torrent.Info.Length = raw.Info.Length
+	} else {
+		for _, f := range raw.Info.Files {
+			torrent.Info.Length += f.Length
+			torrent.Info.Files = append(torrent.Info.Files, FileInfo{
+				Length: f.Length,
+				Path:   append([]string(nil), f.Path...),
+			})
 		}
+	}
+
+	if len(torrent.Info.PieceHashes) == 0 || torrent.Info.PieceLength <= 0 {
+		return nil, fmt.Errorf("invalid torrent metadata: missing pieces or piece length")
 	}
 
 	return torrent, nil

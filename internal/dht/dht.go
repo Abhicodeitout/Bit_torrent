@@ -58,6 +58,16 @@ type candidate struct {
 	queried bool
 }
 
+type krpcResponse struct {
+	Y string        `bencode:"y"`
+	R krpcResponseR `bencode:"r"`
+}
+
+type krpcResponseR struct {
+	Values []string `bencode:"values"`
+	Nodes  string   `bencode:"nodes"`
+}
+
 // candidateList implements sort.Interface, ordering by XOR distance.
 type candidateList []*candidate
 
@@ -219,49 +229,43 @@ func krpcGetPeers(addr string, localID nodeID, infoHash [20]byte, timeout time.D
 		return nil, nil, fmt.Errorf("read KRPC response from %s: %w", addr, err)
 	}
 
-	var msg map[string]interface{}
+	var msg krpcResponse
 	if err := bencode.Unmarshal(bytes.NewReader(resp[:n]), &msg); err != nil {
 		return nil, nil, fmt.Errorf("unmarshal KRPC response: %w", err)
 	}
 
 	// Detect error responses.
-	if y, _ := msg["y"].(string); y == "e" {
+	if msg.Y == "e" {
 		return nil, nil, fmt.Errorf("KRPC error response from %s", addr)
 	}
-
-	r, ok := msg["r"].(map[string]interface{})
-	if !ok {
+	if msg.R.Values == nil && msg.R.Nodes == "" {
 		return nil, nil, fmt.Errorf("KRPC response from %s missing r field", addr)
 	}
 
 	// ── Parse peers (values) ──────────────────────────────────────────────────
 	var peers []types.Peer
-	if values, ok := r["values"].([]interface{}); ok {
-		for _, v := range values {
-			if s, ok := v.(string); ok && len(s) == 6 {
-				b := []byte(s)
-				ip := net.IPv4(b[0], b[1], b[2], b[3])
-				port := binary.BigEndian.Uint16(b[4:6])
-				peers = append(peers, types.Peer{IP: ip, Port: port})
-			}
+	for _, s := range msg.R.Values {
+		if len(s) == 6 {
+			b := []byte(s)
+			ip := net.IPv4(b[0], b[1], b[2], b[3])
+			port := binary.BigEndian.Uint16(b[4:6])
+			peers = append(peers, types.Peer{IP: ip, Port: port})
 		}
 	}
 
 	// ── Parse closer nodes ────────────────────────────────────────────────────
 	var nodes []candidate
-	if nodesStr, ok := r["nodes"].(string); ok {
-		data := []byte(nodesStr)
-		for i := 0; i+26 <= len(data); i += 26 {
-			var id nodeID
-			copy(id[:], data[i:i+20])
-			ip := net.IPv4(data[i+20], data[i+21], data[i+22], data[i+23])
-			port := binary.BigEndian.Uint16(data[i+24 : i+26])
-			if port == 0 {
-				continue
-			}
-			nodeAddr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port))
-			nodes = append(nodes, candidate{id: id, addr: nodeAddr})
+	data := []byte(msg.R.Nodes)
+	for i := 0; i+26 <= len(data); i += 26 {
+		var id nodeID
+		copy(id[:], data[i:i+20])
+		ip := net.IPv4(data[i+20], data[i+21], data[i+22], data[i+23])
+		port := binary.BigEndian.Uint16(data[i+24 : i+26])
+		if port == 0 {
+			continue
 		}
+		nodeAddr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port))
+		nodes = append(nodes, candidate{id: id, addr: nodeAddr})
 	}
 
 	return peers, nodes, nil

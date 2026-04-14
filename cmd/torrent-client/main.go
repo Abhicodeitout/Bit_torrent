@@ -18,6 +18,15 @@ import (
 	"torrent-client/internal/types"
 )
 
+var publicTrackerFallback = []string{
+	"udp://tracker.opentrackr.org:1337/announce",
+	"udp://open.stealth.si:80/announce",
+	"udp://tracker.torrent.eu.org:451/announce",
+	"udp://exodus.desync.com:6969/announce",
+	"udp://tracker.openbittorrent.com:6969/announce",
+	"udp://tracker.dler.org:6969/announce",
+}
+
 func main() {
 	fs := flag.NewFlagSet("torrent-client", flag.ExitOnError)
 	quiet := fs.Bool("quiet", false, "suppress downloader progress/stats output")
@@ -82,20 +91,22 @@ func main() {
 					peers = append(peers, p)
 				}
 			}
+			peers = dedupePeers(peers)
 		}
 		if len(peers) == 0 {
 			fmt.Println("No peers from trackers — trying DHT (BEP 5)...")
-			dhtPeers, err := dht.GetPeers(magnet.InfoHash, 50, 45*time.Second)
-			if err != nil {
+			dhtPeers, err := discoverDHTPeers(magnet.InfoHash, 2, 50, 30*time.Second)
+			if err != nil || len(dhtPeers) == 0 {
 				fmt.Println("DHT:", err)
 			} else {
 				peers = append(peers, dhtPeers...)
 			}
 		} else if len(peers) < 5 {
 			fmt.Printf("Only %d tracker peer(s) — also querying DHT...\n", len(peers))
-			dhtPeers, _ := dht.GetPeers(magnet.InfoHash, 50, 30*time.Second)
+			dhtPeers, _ := discoverDHTPeers(magnet.InfoHash, 2, 50, 20*time.Second)
 			peers = append(peers, dhtPeers...)
 		}
+		peers = dedupePeers(peers)
 		fmt.Printf("Found %d peers — fetching torrent metadata via BEP 9...\n", len(peers))
 
 		info, err := protocol.FetchMetadataFromPeers(peers, magnet.InfoHash, peerID)
@@ -163,11 +174,12 @@ func main() {
 		peers = gatherPeers(torrentFile.InfoHash, trackers, torrentFile, peerID, opts.ListenPort, "started")
 		if len(peers) < 5 && !torrentFile.Info.Private {
 			fmt.Printf("Only %d tracker peer(s) — also querying DHT...\n", len(peers))
-			dhtPeers, _ := dht.GetPeers(torrentFile.InfoHash, 50, 30*time.Second)
+			dhtPeers, _ := discoverDHTPeers(torrentFile.InfoHash, 2, 50, 20*time.Second)
 			peers = append(peers, dhtPeers...)
 		} else if len(peers) < 5 && torrentFile.Info.Private {
 			fmt.Printf("Only %d tracker peer(s) and torrent is private; skipping DHT.\n", len(peers))
 		}
+		peers = dedupePeers(peers)
 	}
 
 	if len(peers) == 0 {
@@ -251,25 +263,60 @@ func buildTrackerList(tf *types.TorrentFile) []string {
 			add(u)
 		}
 	}
+	if !tf.Info.Private {
+		for _, tr := range publicTrackerFallback {
+			add(tr)
+		}
+	}
 	return list
 }
 
 // gatherPeers contacts every tracker URL in order, collecting peers from each
 // and stopping early once 50 or more distinct peers have been found.
 func gatherPeers(infoHash [20]byte, trackers []string, tf *types.TorrentFile, peerID [20]byte, port uint16, event string) []types.Peer {
+	const (
+		targetPeers    = 80
+		maxRounds      = 3
+		trackerRetries = 2
+	)
+
 	var peers []types.Peer
-	for _, tr := range trackers {
+	for round := 0; round < maxRounds && len(peers) < targetPeers; round++ {
+		for _, tr := range trackers {
+			req := tracker.AnnounceRequest{
+				InfoHash: infoHash,
+				PeerID:   peerID,
+				Port:     port,
+				Left:     tf.Info.Length,
+				Event:    event,
+			}
+
+			newPeers, err := announceTrackerWithRetries(tr, tf, req, trackerRetries)
+			if err != nil {
+				fmt.Printf("Tracker %s: %v\n", tr, err)
+				continue
+			}
+			fmt.Printf("Tracker %s: %d peers\n", tr, len(newPeers))
+			peers = dedupePeers(append(peers, newPeers...))
+			if len(peers) >= targetPeers {
+				break
+			}
+		}
+		if len(peers) < targetPeers {
+			time.Sleep(1200 * time.Millisecond)
+		}
+	}
+
+	return peers
+}
+
+func announceTrackerWithRetries(tr string, tf *types.TorrentFile, req tracker.AnnounceRequest, retries int) ([]types.Peer, error) {
+	var lastErr error
+	for attempt := 0; attempt < retries; attempt++ {
 		var (
 			newPeers []types.Peer
 			err      error
 		)
-		req := tracker.AnnounceRequest{
-			InfoHash: infoHash,
-			PeerID:   peerID,
-			Port:     port,
-			Left:     tf.Info.Length,
-			Event:    event,
-		}
 		switch {
 		case strings.HasPrefix(tr, "udp://"):
 			newPeers, err = tracker.AnnounceUDPWithRequest(tr, req)
@@ -278,19 +325,55 @@ func gatherPeers(infoHash [20]byte, trackers []string, tf *types.TorrentFile, pe
 			tfCopy.Announce = tr
 			newPeers, err = tracker.AnnounceToHTTPTrackerWithRequest(&tfCopy, req)
 		default:
-			continue // ws://, wss://, etc. not supported
+			return nil, fmt.Errorf("unsupported tracker scheme")
 		}
+		if err == nil {
+			return newPeers, nil
+		}
+		lastErr = err
+		time.Sleep(time.Duration(attempt+1) * 450 * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
+func discoverDHTPeers(infoHash [20]byte, rounds, maxPeers int, timeout time.Duration) ([]types.Peer, error) {
+	var peers []types.Peer
+	var lastErr error
+	for i := 0; i < rounds; i++ {
+		pp, err := dht.GetPeers(infoHash, maxPeers, timeout)
 		if err != nil {
-			fmt.Printf("Tracker %s: %v\n", tr, err)
+			lastErr = err
 			continue
 		}
-		fmt.Printf("Tracker %s: %d peers\n", tr, len(newPeers))
-		peers = append(peers, newPeers...)
-		if len(peers) >= 50 {
-			break // enough to start
+		peers = dedupePeers(append(peers, pp...))
+		if len(peers) >= maxPeers {
+			return peers, nil
 		}
 	}
-	return peers
+	if len(peers) > 0 {
+		return peers, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no DHT peers found")
+	}
+	return nil, lastErr
+}
+
+func dedupePeers(peers []types.Peer) []types.Peer {
+	seen := make(map[string]struct{}, len(peers))
+	out := make([]types.Peer, 0, len(peers))
+	for _, p := range peers {
+		if p.IP == nil || p.Port == 0 {
+			continue
+		}
+		key := net.JoinHostPort(p.IP.String(), fmt.Sprintf("%d", p.Port))
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	return out
 }
 
 func parsePeerAddr(raw string) (types.Peer, bool) {
