@@ -67,6 +67,78 @@ go build -o bin/torrent-client ./cmd/torrent-client/
 
 ---
 
+## Platform Setup
+
+### Linux
+
+```bash
+# Build
+go build -o bin/torrent-client ./cmd/torrent-client/
+
+# Run
+./bin/torrent-client path/to/file.torrent
+```
+
+No extra steps required. The binary runs natively on any Linux distribution with Go 1.23+.
+
+---
+
+### macOS
+
+```bash
+# Build
+go build -o bin/torrent-client ./cmd/torrent-client/
+
+# Run
+./bin/torrent-client path/to/file.torrent
+```
+
+**First-run Gatekeeper warning:** macOS may block the binary because it was built locally and is unsigned. If you see *"cannot be opened because the developer cannot be verified"*, run once:
+
+```bash
+xattr -d com.apple.quarantine bin/torrent-client
+```
+
+Then re-run normally. Alternatively, go to **System Settings → Privacy & Security → Allow Anyway**.
+
+---
+
+### Windows
+
+**Prerequisites:** Install Go from [go.dev/dl](https://go.dev/dl/) and ensure `%GOPATH%\bin` is on your `PATH`.
+
+**Command Prompt (cmd.exe):**
+
+```cmd
+:: Build
+go build -o bin\torrent-client.exe .\cmd\torrent-client\
+
+:: Run .torrent
+bin\torrent-client.exe path\to\file.torrent
+
+:: Run magnet link (quote the full URI)
+bin\torrent-client.exe "magnet:?xt=urn:btih:AABBCCDD...&tr=udp://tracker.opentrackr.org:1337/announce"
+```
+
+**PowerShell:**
+
+```powershell
+# Build
+go build -o bin\torrent-client.exe .\cmd\torrent-client\
+
+# Run .torrent
+.\bin\torrent-client.exe path\to\file.torrent
+
+# Run magnet link
+.\bin\torrent-client.exe "magnet:?xt=urn:btih:AABBCCDD...&tr=udp://tracker.opentrackr.org:1337/announce"
+```
+
+> **Note:** Windows Defender SmartScreen may prompt on first run. Click **More info → Run anyway**, or right-click the `.exe` → **Properties → Unblock**.
+
+> **Note:** Output files are saved to `%USERPROFILE%\Downloads\` on Windows.
+
+---
+
 ## Usage
 
 ### Download from a `.torrent` file
