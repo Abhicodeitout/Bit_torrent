@@ -1,203 +1,152 @@
-# BitTorrent Client
+# BitTorrent Client — Technical Overview
 
-A lightweight BitTorrent client written in Go that can download files from both torrent files and magnet links.
+A production-ready BitTorrent client written in Go. Supports `.torrent` files, magnet links with tracker-based peer discovery (HTTP + UDP), DHT peer discovery (BEP 5), and metadata-from-peers (BEP 9/10) for fully trackerless operation.
+
+---
 
 ## Features
 
-- **Torrent File Support**: Parse and download from `.torrent` files using bencode decoding
-- **Magnet Link Support**: Parse magnet URIs and extract info hash and trackers
-- **HTTP Tracker Support**: Communicate with HTTP trackers to discover peers
-- **UDP Tracker Support**: Basic UDP tracker support (simplified implementation)
-- **BitTorrent Wire Protocol**: Full implementation of the BitTorrent peer-to-peer protocol
-  - Handshake negotiation
-  - Message handling (interested, choke, unchoke, request, piece, etc.)
-  - Piece validation using SHA-1 hashing
-- **Multi-threaded Downloading**: Download pieces concurrently from multiple peers
-- **Piece Validation**: Verify downloaded pieces against their SHA-1 hashes
+- **Torrent File Support** — Full bencode decoding, single-file and multi-file torrents
+- **Magnet Link Support** — Hex and base32 info hash, multiple `tr=` parameters
+- **HTTP Tracker (BEP 3)** — Compact byte-stream and dictionary peer formats
+- **UDP Tracker (BEP 15)** — Full connect/announce handshake over UDP
+- **DHT Peer Discovery (BEP 5)** — Kademlia iterative `get_peers` lookup via public bootstrap nodes; used automatically when trackers return no/few peers or the magnet has no `tr=`
+- **Extension Protocol (BEP 10)** — Capability negotiation handshake
+- **ut_metadata / BEP 9** — Fetch and SHA-1-verify the info dictionary directly from swarm peers; enables full magnet-link downloads
+- **BitTorrent Wire Protocol** — Handshake, choke/unchoke/interested, bitfield, request, piece, cancel, keep-alive
+- **Concurrent Downloading** — 4 parallel peer connections with automatic piece re-queuing
+- **Piece Integrity** — Every piece SHA-1-verified before being written
+- **IPv4 + IPv6** — `net.JoinHostPort` safe addressing throughout
+
+---
 
 ## Prerequisites
 
-- **Go 1.23.0 or higher** installed on your system
-- **git** (optional, for cloning the repository)
+- **Go 1.23.0 or higher** — [go.dev/dl](https://go.dev/dl/)
+
+---
 
 ## Installation & Setup
 
-### Step 1: Navigate to the Project Directory
-
 ```bash
-cd /workspaces/Bit_torrent
-```
+# 1. Clone
+git clone https://github.com/Abhicodeitout/Bit_torrent.git
+cd Bit_torrent
 
-### Step 2: Install Dependencies
-
-```bash
+# 2. Dependencies
 go mod download
-```
 
-This will download the required dependency: `github.com/jackpal/bencode-go`
-
-### Step 3: Build the Executable
-
-```bash
-# Build with new modular structure
+# 3. Build
 go build -o bin/torrent-client ./cmd/torrent-client/
-```
 
-This creates an executable file named `torrent-client` in the `bin/` directory.
-
-### Step 4: Verify Installation
-
-```bash
+# 4. Verify
 ./bin/torrent-client
+# Usage: torrent-client <path-to-torrent-file-or-magnet-link>
 ```
 
-You should see the usage message if the build was successful.
+---
 
-## Execution Process
+## Usage
 
-### Method 1: Download from a Torrent File
+### Torrent file
 
 ```bash
 ./bin/torrent-client path/to/file.torrent
 ```
 
-**Example:**
-```bash
-./bin/torrent-client big-buck-bunny.torrent
-```
-
-**Process Flow:**
-1. Client reads and parses the `.torrent` file using bencode
-2. Extracts info hash, piece list, and tracker information
-3. Contacts the tracker to get available peers
-4. Connects to peers and performs BitTorrent handshake
-5. Downloads file pieces concurrently (4 simultaneous connections)
-6. Validates each piece using SHA-1 hash
-7. Assembles all pieces into the final file
-8. Saves the file to `$HOME/Downloads/[filename]` or `$HOME/Downloads/downloaded_[hash]`
-
-### Method 2: Download from a Magnet Link
+### Magnet link (with trackers)
 
 ```bash
-./bin/torrent-client "magnet:?xt=urn:btih:..."
+./bin/torrent-client "magnet:?xt=urn:btih:<HASH>&dn=<NAME>&tr=udp://tracker.opentrackr.org:1337/announce"
 ```
 
-**Example:**
-```bash
-./bin/torrent-client "magnet:?xt=urn:btih:8F7C6B1559607AFA3A4CEFB1836E9E8415E3355F&dn=Justin+Beiber+-All+That+Matters"
-```
-
-**Or from the provided file:**
-```bash
-./bin/torrent-client "$(cat magnets.txt | head -1)"
-```
-
-**Process Flow:**
-1. Client parses the magnet URI
-2. Extracts info hash and tracker list from the magnet link
-3. Contacts trackers to discover peers (supports HTTP and UDP trackers)
-4. Proceeds with the same peer connection and download process as torrent files
-5. Saves the downloaded file
-
-## Step-by-Step Guide to Run
-
-### Quick Start (Using Test Files)
+### Bare magnet link (no trackers — DHT only)
 
 ```bash
-# Step 1: Navigate to project
-cd /workspaces/Bit_torrent
-
-# Step 2: Build (if not already built)
-go build -o bin/torrent-client ./cmd/torrent-client/
-
-# Step 3a: Download using torrent file
-./bin/torrent-client big-buck-bunny.torrent
-
-# OR Step 3b: Download using magnet link
-./bin/torrent-client "$(cat magnets.txt | head -1)"
+./bin/torrent-client "magnet:?xt=urn:btih:<HASH>"
 ```
 
-### Using Custom Files
+All three forms download to `$HOME/Downloads/`.
 
-```bash
-# Download from your own torrent file
-./bin/torrent-client /path/to/your/file.torrent
+---
 
-# Download from a magnet link you have
-./bin/torrent-client "magnet:?xt=urn:btih:YOUR_INFO_HASH&tr=http://tracker.example.com"
+## Full Download Flow
+
+```
+Input
+  │
+  ├─ .torrent ──► Bencode decode ──────────────────────────────────────┐
+  │                                                                      │
+  └─ magnet ───► Parse URI                                              │
+                    │                                                    │
+                    ▼                                                    │
+            Peer Discovery                                               │
+            1. HTTP trackers  (BEP 3)                                   │
+            2. UDP trackers   (BEP 15)                                  │
+            3. DHT bootstrap  (BEP 5)  ← automatic fallback            │
+                    │                                                    │
+                    ▼                                                    │
+            BEP 10 ext handshake                                         │
+            BEP 9  ut_metadata fetch  ◄──────── (magnet only) ─────────┘
+            SHA-1 verify metadata                                        │
+                    │                                                    │
+                    └──────────────────┬─────────────────────────────────┘
+                                       ▼
+                              Download Engine
+                              4 parallel peers
+                              16 KB blocks
+                              SHA-1 per piece
+                              auto-retry on fail
+                                       │
+                              $HOME/Downloads/
 ```
 
-## Output
-
-The downloaded file will be saved to:
-- **For single-file torrents:** `$HOME/Downloads/[original-filename]`
-- **For multi-file torrents:** `$HOME/Downloads/[first-file-name]`
-- **Fallback:** `$HOME/Downloads/downloaded_[HASH]` if name unavailable
-
-**Example outputs:**
-```
-/home/user/Downloads/Downloaded_Movie.mp4
-/home/user/Downloads/document.pdf
-/home/user/Downloads/downloaded_8f7c6b155960
-```
+---
 
 ## Project Structure
-
-The project follows Go conventions for clean, maintainable code organization:
 
 ```
 Bit_torrent/
 ├── cmd/
 │   └── torrent-client/
-│       └── main.go              # Application entry point
+│       └── main.go              # Entry point — orchestrates the full flow
 ├── internal/
-│   ├── types/
-│   │   ├── types.go            # Type definitions and data structures
-│   │   └── parser.go           # Torrent/Magnet link parsing functions
+│   ├── dht/
+│   │   └── dht.go               # BEP 5 — Kademlia DHT (get_peers, bootstrap)
 │   ├── protocol/
-│   │   └── protocol.go         # BitTorrent wire protocol implementation
+│   │   ├── protocol.go          # Wire protocol (handshake, messages, io.ReadFull)
+│   │   └── metadata.go          # BEP 10 ext handshake + BEP 9 ut_metadata
 │   ├── tracker/
-│   │   └── tracker.go          # Tracker communication (HTTP/UDP)
+│   │   └── tracker.go           # HTTP (BEP 3) + UDP tracker (BEP 15)
+│   ├── types/
+│   │   ├── types.go             # Core structs: TorrentFile, Peer, MagnetLink …
+│   │   └── parser.go            # .torrent bencode parser + magnet URI parser
 │   └── downloader/
-│       └── downloader.go       # Piece downloading and file assembly
+│       └── downloader.go        # Concurrent downloader + file assembly
 ├── bin/
-│   └── torrent-client          # Compiled executable
-├── docs/
-│   ├── README.md              # Project overview (this file)
-│   ├── EXECUTION.md           # Step-by-step execution guide
-│   ├── UNIVERSAL_SUPPORT.md   # Universal compatibility details
-│   ├── REFERENCE.md           # Complete reference guide
-│   ├── INDEX.md               # Documentation index
-│   └── examples/              
-│       ├── EXAMPLES.sh        # Real-world usage examples
-│       └── USAGE.sh           # Quick usage reference
-├── LICENSE                     # MIT License
-├── go.mod / go.sum            # Go module dependencies
-├── magnets.txt                # Example magnet links
-└── big-buck-bunny.torrent     # Test torrent file
+│   └── torrent-client           # Compiled binary
+├── docs/                        # Extended documentation
+├── go.mod
+├── go.sum
+└── LICENSE                      # MIT
 ```
 
-### Folder Breakdown
+---
 
-**`cmd/`** - Command-line application entry point
-- Contains only the main executable code
-- Clean separation between app and library code
+## Output Location
 
-**`internal/`** - Internal packages (not importable by external code)
-- `types/` - Data structures and torrent file parsing
-  - `types.go` - Type definitions for Torrent, Peer, MagnetLink, etc.
-  - `parser.go` - Functions for parsing .torrent files and magnet links
-- `protocol/` - BitTorrent wire protocol
-  - Handshake, message encoding/decoding, piece requests
-- `tracker/` - Tracker communication
-  - HTTP tracker announcement and peer discovery
-  - UDP tracker support (simplified)
-- `downloader/` - Download engine
-  - Multi-threaded piece downloading
-  - Hash validation and file assembly
+| Torrent type | Output |
+|---|---|
+| Single-file with name | `$HOME/Downloads/<filename>` |
+| Multi-file torrent | `$HOME/Downloads/<first-file>` |
+| Name unavailable | `$HOME/Downloads/downloaded_<8-hex-bytes>` |
 
-**`bin/`** - Build output
-- Compiled executable goes here
+---
+
+## License
+
+[MIT](../LICENSE)
+
 - Easily portable to other systems
 
 **`docs/`** - Documentation

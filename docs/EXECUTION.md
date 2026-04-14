@@ -1,102 +1,178 @@
-# BitTorrent Client - Execution Guide
+# BitTorrent Client — Execution Guide
 
 ## Quick Start (30 seconds)
 
 ```bash
-cd /workspaces/Bit_torrent
+git clone https://github.com/Abhicodeitout/Bit_torrent.git
+cd Bit_torrent
 go build -o bin/torrent-client ./cmd/torrent-client/
-./bin/torrent-client big-buck-bunny.torrent
+./bin/torrent-client your-file.torrent
 ```
 
 ---
 
-## Full Execution Steps
+## Full Step-by-Step
 
-### Prerequisites Check
-
-Before running, ensure you have Go installed:
+### Step 1 — Prerequisites
 
 ```bash
 go version
-# Should output: go version go1.23.0 (or higher)
+# need: go1.23.0 or higher
 ```
 
----
+If not installed: https://go.dev/dl/
 
-### Step 1: Prepare the Project
+### Step 2 — Get the code
 
 ```bash
-# Navigate to project directory
-cd /workspaces/Bit_torrent
-
-# Verify all files are present
-ls -la
-# You should see: client.go, downloader.go, tracker.go, protocol.go, types.go, go.mod, go.sum
+git clone https://github.com/Abhicodeitout/Bit_torrent.git
+cd Bit_torrent
 ```
 
----
-
-### Step 2: Download Dependencies
+### Step 3 — Install dependencies
 
 ```bash
-# Download required Go modules
 go mod download
-
-# Verify dependencies (optional)
 go mod verify
 ```
 
----
-
-### Step 3: Build the Binary
+### Step 4 — Build
 
 ```bash
-# Compile the project
+go build -o bin/torrent-client ./cmd/torrent-client/
+```
+
+Verify:
+
+```bash
+./bin/torrent-client
+# Usage: torrent-client <path-to-torrent-file-or-magnet-link>
+```
+
+---
+
+## Running — Option A: Torrent File
+
+```bash
+./bin/torrent-client path/to/file.torrent
+```
+
+Example console output:
+
+```
+Torrent: InfoHash=8f7c6b1559607afa...  Pieces=8777  Size=367008767 bytes
+Tracker udp://tracker.opentrackr.org:1337/announce: 45 peers
+Starting download from 45 peers...
+Downloading 8777 pieces from 45 peers
+Downloaded piece 0 from 93.184.216.34
+Downloaded piece 1 from 104.21.33.91
+...
+All pieces downloaded, assembling file...
+File assembled successfully at: /home/user/Downloads/big_buck_bunny.mp4
+```
+
+---
+
+## Running — Option B: Magnet Link with Trackers
+
+```bash
+./bin/torrent-client "magnet:?xt=urn:btih:<HASH>&dn=<NAME>&tr=udp://tracker.opentrackr.org:1337/announce"
+```
+
+Example console output:
+
+```
+Magnet: InfoHash=8f7c6b1559607afa...  Name="Big Buck Bunny"  Trackers=3
+Tracker udp://tracker.opentrackr.org:1337/announce: 38 peers
+Found 38 peers — fetching torrent metadata via BEP 9...
+Metadata from 93.184.216.34: Fetched metadata
+Metadata ready: 8777 pieces, 367008767 bytes total
+Starting download from 38 peers...
+...
+File assembled successfully at: /home/user/Downloads/big_buck_bunny.mp4
+```
+
+---
+
+## Running — Option C: Bare Magnet Link (No Trackers — DHT)
+
+```bash
+./bin/torrent-client "magnet:?xt=urn:btih:<HASH>"
+```
+
+Example console output:
+
+```
+Magnet: InfoHash=8f7c6b1559607afa...  Name=""  Trackers=0
+No peers from trackers — trying DHT (BEP 5)...
+DHT: discovered 28 peers
+Found 28 peers — fetching torrent metadata via BEP 9...
+Metadata ready: 8777 pieces, 367008767 bytes total
+Starting download from 28 peers...
+```
+
+---
+
+## Full Flow Diagram
+
+```
+User Input (.torrent file or magnet link)
+              │
+              ├─ .torrent ──► bencode decode ──► TorrentInfo ready
+              │
+              └─ magnet ────► parse URI
+                                    │
+                         ┌──────────▼──────────┐
+                         │   Peer Discovery     │
+                         │  1. HTTP trackers    │
+                         │  2. UDP trackers     │
+                         │  3. DHT (fallback)   │
+                         └──────────┬──────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │  BEP 10 ext shake   │  (magnet only)
+                         │  BEP 9  ut_metadata │
+                         │  SHA-1 verify       │
+                         └──────────┬──────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │  Download Engine    │
+                         │  4 parallel peers   │
+                         │  16 KB blocks       │
+                         │  SHA-1 per piece    │
+                         │  auto-retry         │
+                         └──────────┬──────────┘
+                                    │
+                          $HOME/Downloads/<file>
+```
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---|---|---|
+| `go: command not found` | Go not installed | Install from https://go.dev/dl/ |
+| `No peers found` | All trackers offline + DHT dry | Try a more popular torrent, or check internet |
+| `metadata SHA1 mismatch` | Corrupted data from peer | Client retries next peer automatically |
+| `piece X hash mismatch` | Bad block from peer | Piece is re-queued automatically |
+| `dial tcp: connection refused` | Peer offline | Expected — many peers are tried |
+
+---
+
+## Cross-Platform Build
+
+```bash
+# Linux (default)
 go build -o bin/torrent-client ./cmd/torrent-client/
 
-# Verify the binary was created
-file torrent-client
-# Output: torrent-client: ELF 64-bit LSB executable
+# macOS
+GOOS=darwin GOARCH=arm64 go build -o bin/torrent-client-mac ./cmd/torrent-client/
+
+# Windows
+GOOS=windows GOARCH=amd64 go build -o bin/torrent-client.exe ./cmd/torrent-client/
 ```
 
----
-
-### Step 4: Execute - Option A (Torrent File)
-
-```bash
-# Run with the provided test torrent
-./bin/torrent-client big-buck-bunny.torrent
-
-# Console Output:
-# Parsing torrent file...
-# Torrent parsed. InfoHash: <40-char-hex>
-# Files: <size> bytes
-# Pieces: <number>
-# Contacting tracker...
-# Found <N> peers, starting download...
-```
-
----
-
-### Step 5: Execute - Option B (Magnet Link)
-
-```bash
-# Extract and use magnet link from file
-MAGNET=$(cat magnets.txt | head -1)
-./bin/torrent-client "$MAGNET"
-
-# Or directly pass magnet link
-./bin/torrent-client "magnet:?xt=urn:btih:8F7C6B1559607AFA3A4CEFB1836E9E8415E3355F&dn=..."
-
-# Console Output:
-# Parsing magnet link...
-# Magnet link parsed. InfoHash: <40-char-hex>
-# Name: <torrent-name>
-# Trackers: <number>
-# Contacting tracker(s)...
-```
-
----
 
 ## Execution Flow Diagram
 

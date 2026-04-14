@@ -20,7 +20,7 @@ const (
 
 // ConnectToPeer establishes a connection to the specified peer.
 func ConnectToPeer(peer types.Peer) (net.Conn, error) {
-	address := fmt.Sprintf("%s:%d", peer.IP.String(), peer.Port)
+	address := net.JoinHostPort(peer.IP.String(), fmt.Sprintf("%d", peer.Port))
 	fmt.Printf("Attempting to connect to peer: %s\n", address)
 
 	conn, err := net.DialTimeout("tcp", address, connTimeout)
@@ -38,38 +38,64 @@ func DownloadTorrent(torrent *types.TorrentFile, peers []types.Peer, peerID [20]
 	if torrent == nil || len(torrent.Info.PieceHashes) == 0 {
 		return fmt.Errorf("invalid torrent or no pieces to download")
 	}
+	if len(peers) == 0 {
+		return fmt.Errorf("no peers available")
+	}
 
 	numPieces := len(torrent.Info.PieceHashes)
 	pieces := make([][]byte, numPieces)
-	downloaded := make([]bool, numPieces)
 	var mu sync.Mutex
 
 	fmt.Printf("Downloading %d pieces from %d peers\n", numPieces, len(peers))
 
-	// Create a channel for download tasks
-	taskChan := make(chan int, numPieces)
-	var wg sync.WaitGroup
-
-	// Queue all pieces for download
+	// Buffer at 2x numPieces to allow re-queuing without blocking.
+	taskChan := make(chan int, numPieces*2)
 	for i := 0; i < numPieces; i++ {
 		taskChan <- i
 	}
-	close(taskChan)
 
-	// Start worker goroutines
-	for i := 0; i < numGoroutine && i < len(peers); i++ {
+	numWorkers := numGoroutine
+	if numWorkers > len(peers) {
+		numWorkers = len(peers)
+	}
+
+	var (
+		wg         sync.WaitGroup
+		downloaded int
+		stopOnce   sync.Once
+	)
+	stopCh := make(chan struct{})
+
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func(peerIdx int) {
+		go func(workerIdx int) {
 			defer wg.Done()
-			peer := peers[peerIdx%len(peers)]
+			peer := peers[workerIdx%len(peers)]
 
-			for pieceIdx := range taskChan {
-				if err := downloadPieceFromPeer(&peer, torrent, pieceIdx, pieces, &downloaded, &mu, peerID); err != nil {
-					fmt.Printf("Failed to download piece %d from peer %s: %v\n", pieceIdx, peer.IP, err)
-					// Re-queue the piece for another attempt
-					taskChan <- pieceIdx
-				} else {
-					fmt.Printf("Downloaded piece %d from %s\n", pieceIdx, peer.IP)
+			for {
+				select {
+				case <-stopCh:
+					return
+				case pieceIdx := <-taskChan:
+					if err := downloadPieceFromPeer(&peer, torrent, pieceIdx, pieces, &mu, peerID); err != nil {
+						fmt.Printf("Failed to download piece %d from peer %s: %v\n", pieceIdx, peer.IP, err)
+						// Re-queue; if stop has been signalled drop the piece.
+						select {
+						case taskChan <- pieceIdx:
+						case <-stopCh:
+							return
+						}
+					} else {
+						fmt.Printf("Downloaded piece %d from %s\n", pieceIdx, peer.IP)
+						mu.Lock()
+						downloaded++
+						done := downloaded >= numPieces
+						mu.Unlock()
+						if done {
+							stopOnce.Do(func() { close(stopCh) })
+							return
+						}
+					}
 				}
 			}
 		}(i)
@@ -77,15 +103,8 @@ func DownloadTorrent(torrent *types.TorrentFile, peers []types.Peer, peerID [20]
 
 	wg.Wait()
 
-	// Check if all pieces are downloaded
 	mu.Lock()
-	allDownloaded := true
-	for _, d := range downloaded {
-		if !d {
-			allDownloaded = false
-			break
-		}
-	}
+	allDownloaded := downloaded >= numPieces
 	mu.Unlock()
 
 	if !allDownloaded {
@@ -97,7 +116,7 @@ func DownloadTorrent(torrent *types.TorrentFile, peers []types.Peer, peerID [20]
 }
 
 // downloadPieceFromPeer downloads a specific piece from a peer.
-func downloadPieceFromPeer(peer *types.Peer, torrent *types.TorrentFile, pieceIdx int, pieces [][]byte, downloaded *[]bool, mu *sync.Mutex, peerID [20]byte) error {
+func downloadPieceFromPeer(peer *types.Peer, torrent *types.TorrentFile, pieceIdx int, pieces [][]byte, mu *sync.Mutex, peerID [20]byte) error {
 	conn, err := ConnectToPeer(*peer)
 	if err != nil {
 		return err
@@ -183,7 +202,6 @@ func downloadPieceFromPeer(peer *types.Peer, torrent *types.TorrentFile, pieceId
 	// Store the piece
 	mu.Lock()
 	pieces[pieceIdx] = pieceData
-	(*downloaded)[pieceIdx] = true
 	mu.Unlock()
 
 	return nil
@@ -242,7 +260,7 @@ func AssembleFile(pieces [][]byte, torrent *types.TorrentFile) error {
 
 // RequestPiece requests a specific piece from the peer (legacy, kept for compatibility).
 func RequestPiece(peer types.Peer, index int) ([]byte, error) {
-	address := fmt.Sprintf("%s:%d", peer.IP.String(), peer.Port)
+	address := net.JoinHostPort(peer.IP.String(), fmt.Sprintf("%d", peer.Port))
 
 	conn, err := net.DialTimeout("tcp", address, 30*time.Second)
 	if err != nil {

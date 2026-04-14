@@ -2,6 +2,7 @@ package tracker
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,20 +15,98 @@ import (
 	"torrent-client/internal/types"
 )
 
-// AnnounceUDP sends an announcement to the UDP tracker and retrieves a list of peers.
+// AnnounceUDP implements the full UDP tracker protocol (BEP 15).
 func AnnounceUDP(trackerURL string, infoHash [20]byte, peerID [20]byte, port uint16) ([]types.Peer, error) {
-	conn, err := net.DialTimeout("udp", trackerURL, 10*time.Second)
+	u, err := url.Parse(trackerURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to UDP tracker: %v", err)
+		return nil, fmt.Errorf("parse UDP tracker URL: %w", err)
+	}
+	host := u.Host
+	if host == "" {
+		return nil, fmt.Errorf("empty host in UDP tracker URL: %s", trackerURL)
+	}
+
+	conn, err := net.DialTimeout("udp", host, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("dial UDP tracker %s: %w", host, err)
 	}
 	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(15 * time.Second)) //nolint:errcheck
 
-	// This is a simplified UDP tracker implementation
-	// A full implementation would follow the UDP tracker protocol specification
-	fmt.Printf("Connected to UDP tracker at %s\n", trackerURL)
+	// ── Connect request ────────────────────────────────────────────────────────
+	var txID1 [4]byte
+	rand.Read(txID1[:]) //nolint:errcheck
 
-	// For now, return empty peer list as UDP tracker implementation is complex
-	return []types.Peer{}, nil
+	connectReq := make([]byte, 16)
+	binary.BigEndian.PutUint64(connectReq[0:8], 0x41727101980) // BEP 15 magic
+	binary.BigEndian.PutUint32(connectReq[8:12], 0)            // action: connect
+	copy(connectReq[12:16], txID1[:])
+
+	if _, err := conn.Write(connectReq); err != nil {
+		return nil, fmt.Errorf("send connect request: %w", err)
+	}
+
+	connectResp := make([]byte, 16)
+	n, err := conn.Read(connectResp)
+	if err != nil || n < 16 {
+		return nil, fmt.Errorf("read connect response (n=%d): %w", n, err)
+	}
+	if binary.BigEndian.Uint32(connectResp[0:4]) != 0 {
+		return nil, fmt.Errorf("unexpected action in connect response")
+	}
+	if !bytes.Equal(connectResp[4:8], txID1[:]) {
+		return nil, fmt.Errorf("transaction ID mismatch in connect response")
+	}
+	connectionID := binary.BigEndian.Uint64(connectResp[8:16])
+
+	// ── Announce request ───────────────────────────────────────────────────────
+	var txID2 [4]byte
+	rand.Read(txID2[:]) //nolint:errcheck
+
+	announceReq := make([]byte, 98)
+	binary.BigEndian.PutUint64(announceReq[0:8], connectionID)
+	binary.BigEndian.PutUint32(announceReq[8:12], 1) // action: announce
+	copy(announceReq[12:16], txID2[:])
+	copy(announceReq[16:36], infoHash[:])
+	copy(announceReq[36:56], peerID[:])
+	// bytes 56-79: downloaded(8), left(8), uploaded(8) — all zero
+	binary.BigEndian.PutUint32(announceReq[80:84], 2) // event: started
+	// bytes 84-87: IP = 0 (use default)
+	rand.Read(announceReq[88:92])                              //nolint:errcheck  key (random)
+	binary.BigEndian.PutUint32(announceReq[92:96], ^uint32(0)) // num_want: -1
+	binary.BigEndian.PutUint16(announceReq[96:98], port)
+
+	if _, err := conn.Write(announceReq); err != nil {
+		return nil, fmt.Errorf("send announce request: %w", err)
+	}
+
+	announceResp := make([]byte, 65536)
+	n, err = conn.Read(announceResp)
+	if err != nil {
+		return nil, fmt.Errorf("read announce response: %w", err)
+	}
+	if n < 20 {
+		return nil, fmt.Errorf("announce response too short: %d bytes", n)
+	}
+
+	action := binary.BigEndian.Uint32(announceResp[0:4])
+	if action == 3 { // error
+		msg := ""
+		if n > 8 {
+			msg = string(announceResp[8:n])
+		}
+		return nil, fmt.Errorf("tracker error: %s", msg)
+	}
+	if action != 1 {
+		return nil, fmt.Errorf("unexpected announce action: %d", action)
+	}
+	if !bytes.Equal(announceResp[4:8], txID2[:]) {
+		return nil, fmt.Errorf("transaction ID mismatch in announce response")
+	}
+	// bytes 8-11: interval   12-15: leechers   16-19: seeders
+	peers := ParsePeersCompact(announceResp[20:n])
+	fmt.Printf("UDP tracker %s: %d peers\n", host, len(peers))
+	return peers, nil
 }
 
 // AnnounceToHTTPTracker sends an HTTP GET request to the HTTP tracker and retrieves a list of peers.

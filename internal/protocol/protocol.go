@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"time"
 )
@@ -57,8 +58,7 @@ func Handshake(conn net.Conn, infoHash [20]byte, peerID [20]byte) ([20]byte, err
 	// Receive handshake response
 	conn.SetReadDeadline(time.Now().Add(readTimeout))
 	response := make([]byte, 68) // 1 + 19 + 8 + 20 + 20
-	_, err = conn.Read(response)
-	if err != nil {
+	if _, err = io.ReadFull(conn, response); err != nil {
 		return [20]byte{}, fmt.Errorf("failed to receive handshake: %v", err)
 	}
 
@@ -81,12 +81,14 @@ func SendMessage(conn net.Conn, msg Message) error {
 	return err
 }
 
+// maxMessageSize caps a single protocol message at 32 MB to prevent OOM.
+const maxMessageSize = 32 * 1024 * 1024
+
 // ReadMessage reads a message from the peer.
 func ReadMessage(conn net.Conn) (Message, error) {
 	conn.SetReadDeadline(time.Now().Add(readTimeout))
 	lengthBuf := make([]byte, 4)
-	_, err := conn.Read(lengthBuf)
-	if err != nil {
+	if _, err := io.ReadFull(conn, lengthBuf); err != nil {
 		return Message{}, err
 	}
 
@@ -95,10 +97,12 @@ func ReadMessage(conn net.Conn) (Message, error) {
 		// Keep-alive - return empty message
 		return Message{ID: -1}, nil
 	}
+	if length > maxMessageSize {
+		return Message{}, fmt.Errorf("message size %d exceeds limit", length)
+	}
 
 	payload := make([]byte, length)
-	_, err = conn.Read(payload)
-	if err != nil {
+	if _, err := io.ReadFull(conn, payload); err != nil {
 		return Message{}, err
 	}
 
@@ -154,6 +158,8 @@ func (m Message) String() string {
 		return "Piece"
 	case MsgCancel:
 		return "Cancel"
+	case MsgExtended:
+		return "Extended"
 	default:
 		return "Unknown"
 	}
