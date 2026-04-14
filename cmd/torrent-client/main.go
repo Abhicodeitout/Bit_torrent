@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -14,12 +15,34 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: torrent-client <path-to-torrent-file-or-magnet-link>")
+	fs := flag.NewFlagSet("torrent-client", flag.ExitOnError)
+	quiet := fs.Bool("quiet", false, "suppress downloader progress/stats output")
+	verbose := fs.Bool("verbose", false, "force verbose downloader progress/stats output")
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: torrent-client [--quiet|--verbose] <path-to-torrent-file-or-magnet-link>\n")
+		fs.PrintDefaults()
+	}
+
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		fmt.Println("Failed to parse arguments:", err)
 		os.Exit(1)
 	}
 
-	input := os.Args[1]
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	input := fs.Arg(0)
+	opts := downloader.DefaultDownloadOptions()
+	if *quiet {
+		opts.Verbose = false
+		opts.EnableStats = false
+	}
+	if *verbose {
+		opts.Verbose = true
+		opts.EnableStats = true
+	}
 	peerID := types.GeneratePeerID()
 
 	var torrentFile *types.TorrentFile
@@ -91,7 +114,7 @@ func main() {
 	}
 
 	fmt.Printf("Starting download from %d peers...\n", len(peers))
-	if err := downloader.DownloadTorrent(torrentFile, peers, peerID); err != nil {
+	if err := downloader.DownloadTorrentWithOptions(torrentFile, peers, peerID, opts); err != nil {
 		fmt.Println("Download failed:", err)
 		os.Exit(1)
 	}

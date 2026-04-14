@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	bencode "github.com/jackpal/bencode-go"
@@ -213,4 +214,30 @@ func ParsePeersCompact(data []byte) []types.Peer {
 // ParsePeers is an alias for ParsePeersCompact for backward compatibility
 func ParsePeers(data []byte) []types.Peer {
 	return ParsePeersCompact(data)
+}
+
+// GetPeers resolves peers from a single tracker URL using the appropriate
+// protocol implementation. This keeps a stable API for components that only
+// need "tracker URL in, peers out" behavior.
+func GetPeers(trackerURL string, infoHash [20]byte, peerID [20]byte, torrent *types.TorrentFile) ([]types.Peer, error) {
+	switch {
+	case trackerURL == "":
+		return nil, fmt.Errorf("empty tracker URL")
+	case len(infoHash) == 0:
+		return nil, fmt.Errorf("invalid info hash")
+	case torrent == nil:
+		return nil, fmt.Errorf("nil torrent file")
+	case strings.HasPrefix(trackerURL, "udp://"):
+		return AnnounceUDP(trackerURL, infoHash, peerID, 6881)
+	case strings.HasPrefix(trackerURL, "http://"):
+		tfCopy := *torrent
+		tfCopy.Announce = trackerURL
+		return AnnounceToHTTPTracker(&tfCopy, peerID)
+	case strings.HasPrefix(trackerURL, "https://"):
+		tfCopy := *torrent
+		tfCopy.Announce = trackerURL
+		return AnnounceToHTTPTracker(&tfCopy, peerID)
+	default:
+		return nil, fmt.Errorf("unsupported tracker scheme in %q", trackerURL)
+	}
 }

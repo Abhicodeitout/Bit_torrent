@@ -24,7 +24,13 @@ A fully functional, production-ready BitTorrent client written in Go — support
 | Metadata from peers (BEP 9) | ✅ | `ut_metadata` — download info-dict from swarm |
 | BitTorrent wire protocol | ✅ | Handshake, choke/unchoke, request, piece, cancel |
 | Piece integrity (SHA-1) | ✅ | Every piece verified before writing |
-| Concurrent downloading | ✅ | 4 parallel peer connections |
+| Resumable downloads | ✅ | Persisted piece state + on-disk piece verification |
+| Disk-backed piece writes | ✅ | No full-file in-memory buffering |
+| Adaptive peer scheduling | ✅ | Peer scoring, backoff, temporary quarantine |
+| Continuous peer discovery | ✅ | Trackers + DHT queried during active download |
+| Rarest-first + endgame mode | ✅ | Better swarm efficiency and tail completion |
+| Concurrent downloading | ✅ | Configured worker pool with long-lived peer sessions |
+| Runtime telemetry | ✅ | Piece/peer stats during download, toggleable |
 | Single & multi-file torrents | ✅ | Correct file assembly for both layouts |
 | IPv4 + IPv6 peers | ✅ | `net.JoinHostPort` safe addressing |
 
@@ -61,6 +67,13 @@ go build -o bin/torrent-client ./cmd/torrent-client/
 ./bin/torrent-client path/to/file.torrent
 ```
 
+Optional runtime flags:
+
+```bash
+./bin/torrent-client --quiet path/to/file.torrent
+./bin/torrent-client --verbose path/to/file.torrent
+```
+
 **Example:**
 
 ```bash
@@ -70,11 +83,12 @@ go build -o bin/torrent-client ./cmd/torrent-client/
 **What happens:**
 
 1. Parse torrent file (bencode) — extracts info hash, piece hashes, trackers, file list
-2. Contact all HTTP + UDP trackers to collect peers
-3. If fewer than 5 peers found — also query DHT bootstrap nodes
-4. Connect, handshake, download all pieces concurrently
-5. SHA-1 verify every piece
-6. Assemble and write output to `$HOME/Downloads/`
+2. Load existing resume state (if present) and verify completed pieces from disk
+3. Contact HTTP/UDP trackers and DHT to seed the peer pool
+4. Start adaptive workers with long-lived peer sessions and pipelined block requests
+5. Continue peer discovery in the background while downloading
+6. SHA-1 verify every piece, write directly to output offsets, and persist state
+7. Enter endgame mode near completion to finish tail pieces faster
 
 ---
 
@@ -141,10 +155,11 @@ User input (.torrent file or magnet link)
                                             │
                     ┌───────────────────────▼────────────────────┐
                     │         Download Engine                     │
-                    │  • 4 concurrent peer connections            │
-                    │  • Request piece blocks (16 KB each)        │
-                    │  • SHA-1 verify per piece                   │
-                    │  • Re-queue failed pieces automatically     │
+                    │  • Resume state + piece verification        │
+                    │  • Rarest-first scheduling                  │
+                    │  • Long-lived sessions + pipelined requests │
+                    │  • Adaptive peer scoring/backoff/quarantine │
+                    │  • Endgame duplication near completion      │
                     └───────────────────────┬────────────────────┘
                                             │
                                    $HOME/Downloads/
@@ -167,11 +182,15 @@ Bit_torrent/
 │   │   └── metadata.go          # BEP 10 + BEP 9 — extension + ut_metadata
 │   ├── tracker/
 │   │   └── tracker.go           # HTTP tracker (BEP 3) + UDP tracker (BEP 15)
+│   ├── peer/
+│   │   └── manager.go           # Background peer discovery manager (used by scheduler)
+│   ├── state/
+│   │   └── state.go             # Persistent state helpers
 │   ├── types/
 │   │   ├── types.go             # Core data structures
 │   │   └── parser.go            # .torrent & magnet link parsing
 │   └── downloader/
-│       └── downloader.go        # Concurrent piece downloader + file assembly
+│       └── downloader.go        # Resumable adaptive downloader + telemetry
 ├── bin/
 │   └── torrent-client           # Compiled binary
 ├── docs/                        # Extended documentation

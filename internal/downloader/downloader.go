@@ -1,162 +1,751 @@
 package downloader
 
 import (
+	"context"
 	"crypto/sha1"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"torrent-client/internal/dht"
 	"torrent-client/internal/protocol"
+	"torrent-client/internal/tracker"
 	"torrent-client/internal/types"
 )
 
 const (
 	blockSize    = 16 * 1024 // 16 KB
-	numGoroutine = 4
+	numGoroutine = 10
 	connTimeout  = 10 * time.Second
+
+	peerQueueCapacity = 512
+	discoveryInterval = 25 * time.Second
+	stateSaveInterval = 3 * time.Second
+
+	maxPieceAttempts      = 12
+	maxPiecesPerSession   = 8
+	endgameThreshold      = 12
+	endgameInjectInterval = 2 * time.Second
+	statsLogInterval      = 10 * time.Second
 )
+
+type resumeState struct {
+	Completed []bool `json:"completed"`
+}
+
+// DownloadOptions controls downloader runtime logging behavior.
+type DownloadOptions struct {
+	Verbose     bool
+	EnableStats bool
+}
+
+// DefaultDownloadOptions returns defaults suitable for interactive CLI runs.
+func DefaultDownloadOptions() DownloadOptions {
+	return DownloadOptions{
+		Verbose:     true,
+		EnableStats: true,
+	}
+}
+
+var errPeerMissingPiece = fmt.Errorf("peer missing requested piece")
+
+type peerSession struct {
+	peer      types.Peer
+	conn      net.Conn
+	bitfield  []byte
+	unchoked  bool
+	servedCnt int
+}
+
+type peerStat struct {
+	successes           int
+	failures            int
+	consecutiveFailures int
+	bytes               int64
+	latencyN            int64
+	latencySum          time.Duration
+	lastFailure         time.Time
+	backoffUntil        time.Time
+	quarantinedUntil    time.Time
+}
+
+type peerPool struct {
+	mu        sync.Mutex
+	peers     map[string]types.Peer
+	available map[string]bool
+	stats     map[string]*peerStat
+}
+
+type poolSnapshot struct {
+	totalPeers      int
+	availablePeers  int
+	backoffPeers    int
+	quarantinePeers int
+	totalSuccesses  int
+	totalFailures   int
+	avgLatency      time.Duration
+}
 
 // ConnectToPeer establishes a connection to the specified peer.
 func ConnectToPeer(peer types.Peer) (net.Conn, error) {
 	address := net.JoinHostPort(peer.IP.String(), fmt.Sprintf("%d", peer.Port))
-	fmt.Printf("Attempting to connect to peer: %s\n", address)
-
 	conn, err := net.DialTimeout("tcp", address, connTimeout)
 	if err != nil {
-		fmt.Printf("Failed to connect to peer %s: %v\n", address, err)
 		return nil, err
 	}
-
-	fmt.Printf("Connected to peer: %s\n", address)
 	return conn, nil
 }
 
-// DownloadTorrent downloads pieces from the specified peers.
+// DownloadTorrent downloads pieces from the specified peers using default options.
 func DownloadTorrent(torrent *types.TorrentFile, peers []types.Peer, peerID [20]byte) error {
+	return DownloadTorrentWithOptions(torrent, peers, peerID, DefaultDownloadOptions())
+}
+
+// DownloadTorrentWithOptions downloads pieces with caller-controlled options.
+func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, peerID [20]byte, opts DownloadOptions) error {
 	if torrent == nil || len(torrent.Info.PieceHashes) == 0 {
 		return fmt.Errorf("invalid torrent or no pieces to download")
 	}
-	if len(peers) == 0 {
-		return fmt.Errorf("no peers available")
+
+	logf := func(format string, args ...interface{}) {
+		if opts.Verbose {
+			fmt.Printf(format, args...)
+		}
 	}
 
 	numPieces := len(torrent.Info.PieceHashes)
-	pieces := make([][]byte, numPieces)
-	var mu sync.Mutex
+	outputPath, err := outputFilePath(torrent)
+	if err != nil {
+		return err
+	}
+	statePath := outputPath + ".state.json"
 
-	fmt.Printf("Downloading %d pieces from %d peers\n", numPieces, len(peers))
+	file, completed, remaining, err := prepareOutputAndState(outputPath, statePath, torrent)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
 
-	// Buffer at 2x numPieces to allow re-queuing without blocking.
-	taskChan := make(chan int, numPieces*2)
-	for i := 0; i < numPieces; i++ {
-		taskChan <- i
+	if remaining == 0 {
+		os.Remove(statePath) //nolint:errcheck
+		logf("Already complete: %s\n", outputPath)
+		return nil
 	}
 
-	numWorkers := numGoroutine
-	if numWorkers > len(peers) {
-		numWorkers = len(peers)
+	logf("Downloading %d/%d pieces to %s\n", remaining, numPieces, outputPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var completedCount int64
+	for _, ok := range completed {
+		if ok {
+			completedCount++
+		}
 	}
 
-	var (
-		wg         sync.WaitGroup
-		downloaded int
-		stopOnce   sync.Once
-	)
-	stopCh := make(chan struct{})
+	var stateMu sync.Mutex
+	saveState := func() {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		if err := saveResumeState(statePath, completed); err != nil {
+			logf("state save failed: %v\n", err)
+		}
+	}
 
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func(workerIdx int) {
-			defer wg.Done()
-			peer := peers[workerIdx%len(peers)]
+	pieceQueue := make(chan int, numPieces*2)
+	pool := newPeerPool()
+	seedPeer := func(p types.Peer) {
+		pool.Add(p)
+	}
+
+	for _, p := range peers {
+		seedPeer(p)
+	}
+
+	orderedPieces := buildRarestFirstOrder(torrent, peers, peerID)
+	for _, idx := range orderedPieces {
+		if !completed[idx] {
+			pieceQueue <- idx
+		}
+	}
+
+	trackers := buildTrackerList(torrent)
+	go discoveryLoop(ctx, torrent, trackers, peerID, seedPeer)
+
+	go func() {
+		ticker := time.NewTicker(stateSaveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				saveState()
+			}
+		}
+	}()
+
+	if opts.EnableStats {
+		go func() {
+			ticker := time.NewTicker(statsLogInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					snap := pool.Snapshot()
+					done := atomic.LoadInt64(&completedCount)
+					logf(
+						"Stats: pieces=%d/%d queue=%d peers(total=%d available=%d backoff=%d quarantine=%d) success=%d failures=%d avg-latency=%s\n",
+						done,
+						numPieces,
+						len(pieceQueue),
+						snap.totalPeers,
+						snap.availablePeers,
+						snap.backoffPeers,
+						snap.quarantinePeers,
+						snap.totalSuccesses,
+						snap.totalFailures,
+						snap.avgLatency.Truncate(10*time.Millisecond),
+					)
+				}
+			}
+		}()
+	}
+
+	var pieceWG sync.WaitGroup
+	pieceWG.Add(remaining)
+
+	var endgameStarted atomic.Bool
+	startEndgame := func() {
+		if !endgameStarted.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			ticker := time.NewTicker(endgameInjectInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					stateMu.Lock()
+					for idx := range completed {
+						if completed[idx] {
+							continue
+						}
+						select {
+						case pieceQueue <- idx:
+						default:
+						}
+					}
+					stateMu.Unlock()
+				}
+			}
+		}()
+	}
+
+	var workers sync.WaitGroup
+	workerCount := numGoroutine
+	for i := 0; i < workerCount; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			var sess *peerSession
+			defer func() {
+				if sess != nil {
+					sess.conn.Close() //nolint:errcheck
+					pool.Release(sess.peer)
+				}
+			}()
+
+			releaseSession := func() {
+				if sess == nil {
+					return
+				}
+				sess.conn.Close() //nolint:errcheck
+				pool.Release(sess.peer)
+				sess = nil
+			}
 
 			for {
 				select {
-				case <-stopCh:
+				case <-ctx.Done():
 					return
-				case pieceIdx := <-taskChan:
-					if err := downloadPieceFromPeer(&peer, torrent, pieceIdx, pieces, &mu, peerID); err != nil {
-						fmt.Printf("Failed to download piece %d from peer %s: %v\n", pieceIdx, peer.IP, err)
-						// Re-queue; if stop has been signalled drop the piece.
-						select {
-						case taskChan <- pieceIdx:
-						case <-stopCh:
-							return
+				case pieceIdx := <-pieceQueue:
+					stateMu.Lock()
+					alreadyCompleted := completed[pieceIdx]
+					stateMu.Unlock()
+					if alreadyCompleted {
+						continue
+					}
+
+					ok := false
+					for attempt := 0; attempt < maxPieceAttempts; attempt++ {
+						if sess == nil || sess.servedCnt >= maxPiecesPerSession {
+							releaseSession()
+							peer, err := pool.Acquire(ctx)
+							if err != nil {
+								return
+							}
+							newSession, err := newPeerSession(peer, torrent, peerID)
+							if err != nil {
+								pool.ReportFailure(peer)
+								pool.Release(peer)
+								continue
+							}
+							sess = newSession
 						}
-					} else {
-						fmt.Printf("Downloaded piece %d from %s\n", pieceIdx, peer.IP)
-						mu.Lock()
-						downloaded++
-						done := downloaded >= numPieces
-						mu.Unlock()
-						if done {
-							stopOnce.Do(func() { close(stopCh) })
-							return
+
+						started := time.Now()
+						pieceData, err := downloadPieceFromSession(sess, torrent, pieceIdx)
+						if err != nil {
+							if err == errPeerMissingPiece {
+								pool.ReportFailure(sess.peer)
+								releaseSession()
+								continue
+							}
+							pool.ReportFailure(sess.peer)
+							releaseSession()
+							continue
+						}
+
+						if err := writePiece(file, torrent, pieceIdx, pieceData); err != nil {
+							pool.ReportFailure(sess.peer)
+							releaseSession()
+							continue
+						}
+						pool.ReportSuccess(sess.peer, len(pieceData), time.Since(started))
+
+						stateMu.Lock()
+						if !completed[pieceIdx] {
+							completed[pieceIdx] = true
+							stateMu.Unlock()
+							pieceWG.Done()
+							current := atomic.AddInt64(&completedCount, 1)
+							remainingNow := numPieces - int(current)
+							if remainingNow <= endgameThreshold {
+								startEndgame()
+							}
+							logf("Piece %d complete (%d/%d)\n", pieceIdx, current, numPieces)
+						} else {
+							stateMu.Unlock()
+						}
+
+						sess.servedCnt++
+						ok = true
+						break
+					}
+
+					if !ok {
+						select {
+						case pieceQueue <- pieceIdx:
+						case <-ctx.Done():
 						}
 					}
 				}
 			}
-		}(i)
+		}()
 	}
 
-	wg.Wait()
+	doneCh := make(chan struct{})
+	go func() {
+		pieceWG.Wait()
+		close(doneCh)
+	}()
 
-	mu.Lock()
-	allDownloaded := downloaded >= numPieces
-	mu.Unlock()
-
-	if !allDownloaded {
-		return fmt.Errorf("not all pieces were downloaded")
+	select {
+	case <-doneCh:
+		cancel()
+	case <-time.After(25 * time.Minute):
+		cancel()
+		workers.Wait()
+		saveState()
+		return fmt.Errorf("download timeout waiting for pieces")
 	}
 
-	fmt.Println("All pieces downloaded, assembling file...")
-	return AssembleFile(pieces, torrent)
+	workers.Wait()
+	saveState()
+
+	if !allPiecesComplete(completed) {
+		return fmt.Errorf("download incomplete, resume file kept: %s", statePath)
+	}
+
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync output file: %w", err)
+	}
+	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+		logf("warning: failed to remove state file: %v\n", err)
+	}
+
+	logf("Download complete: %s\n", outputPath)
+	return nil
+}
+
+func newPeerPool() *peerPool {
+	return &peerPool{
+		peers:     make(map[string]types.Peer),
+		available: make(map[string]bool),
+		stats:     make(map[string]*peerStat),
+	}
+}
+
+func peerKey(peer types.Peer) string {
+	return net.JoinHostPort(peer.IP.String(), fmt.Sprintf("%d", peer.Port))
+}
+
+func (p *peerPool) Add(peer types.Peer) {
+	if peer.IP == nil || peer.IP.To4() == nil || peer.Port == 0 {
+		return
+	}
+
+	key := peerKey(peer)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.peers[key]; ok {
+		return
+	}
+	p.peers[key] = peer
+	p.available[key] = true
+	p.stats[key] = &peerStat{}
+}
+
+func (p *peerPool) Acquire(ctx context.Context) (types.Peer, error) {
+	for {
+		now := time.Now()
+		p.mu.Lock()
+		bestKey := ""
+		bestScore := -1e9
+		for key, isAvailable := range p.available {
+			if !isAvailable {
+				continue
+			}
+			st := p.stats[key]
+			if st == nil {
+				continue
+			}
+			if now.Before(st.quarantinedUntil) || now.Before(st.backoffUntil) {
+				continue
+			}
+			score := scorePeer(st)
+			if score > bestScore {
+				bestScore = score
+				bestKey = key
+			}
+		}
+		if bestKey != "" {
+			p.available[bestKey] = false
+			peer := p.peers[bestKey]
+			p.mu.Unlock()
+			return peer, nil
+		}
+		p.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return types.Peer{}, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+func (p *peerPool) Release(peer types.Peer) {
+	key := peerKey(peer)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.peers[key]; ok {
+		p.available[key] = true
+	}
+}
+
+func (p *peerPool) ReportSuccess(peer types.Peer, bytes int, latency time.Duration) {
+	key := peerKey(peer)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st, ok := p.stats[key]
+	if !ok {
+		return
+	}
+	st.successes++
+	st.consecutiveFailures = 0
+	st.bytes += int64(bytes)
+	st.latencyN++
+	st.latencySum += latency
+}
+
+func (p *peerPool) ReportFailure(peer types.Peer) {
+	key := peerKey(peer)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st, ok := p.stats[key]
+	if !ok {
+		return
+	}
+	st.failures++
+	st.consecutiveFailures++
+	st.lastFailure = time.Now()
+
+	// Exponential backoff for flaky peers to reduce repeated failed attempts.
+	backoff := 500 * time.Millisecond
+	if st.consecutiveFailures > 1 {
+		shift := st.consecutiveFailures - 1
+		if shift > 6 {
+			shift = 6
+		}
+		backoff = backoff * time.Duration(1<<shift)
+	}
+	if backoff > 30*time.Second {
+		backoff = 30 * time.Second
+	}
+	st.backoffUntil = time.Now().Add(backoff)
+
+	// Temporarily quarantine persistently bad peers.
+	if st.consecutiveFailures >= 6 {
+		st.quarantinedUntil = time.Now().Add(2 * time.Minute)
+		st.consecutiveFailures = 0
+	}
+}
+
+func scorePeer(st *peerStat) float64 {
+	if st == nil {
+		return 0
+	}
+	score := 1.0 + float64(st.successes)*1.25 - float64(st.failures)*0.9
+	if st.latencyN > 0 {
+		avg := st.latencySum / time.Duration(st.latencyN)
+		score -= avg.Seconds() * 0.35
+	}
+	if time.Since(st.lastFailure) < 8*time.Second {
+		score -= 2
+	}
+	if time.Now().Before(st.quarantinedUntil) {
+		score -= 100
+	}
+	if time.Now().Before(st.backoffUntil) {
+		score -= 10
+	}
+	return score
+}
+
+func (p *peerPool) Snapshot() poolSnapshot {
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	snap := poolSnapshot{}
+	snap.totalPeers = len(p.peers)
+
+	var latencySamples int64
+	for key, peer := range p.peers {
+		_ = peer
+		if p.available[key] {
+			snap.availablePeers++
+		}
+		st := p.stats[key]
+		if st == nil {
+			continue
+		}
+		snap.totalSuccesses += st.successes
+		snap.totalFailures += st.failures
+		if now.Before(st.quarantinedUntil) {
+			snap.quarantinePeers++
+		}
+		if now.Before(st.backoffUntil) {
+			snap.backoffPeers++
+		}
+		latencySamples += st.latencyN
+		snap.avgLatency += st.latencySum
+	}
+
+	if latencySamples > 0 {
+		snap.avgLatency = snap.avgLatency / time.Duration(latencySamples)
+	}
+
+	return snap
+}
+
+func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte) (*peerSession, error) {
+	conn, err := ConnectToPeer(peer)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := protocol.Handshake(conn, torrent.InfoHash, peerID); err != nil {
+		conn.Close() //nolint:errcheck
+		return nil, fmt.Errorf("handshake failed: %w", err)
+	}
+
+	if err := protocol.SendMessage(conn, protocol.InterestedMessage()); err != nil {
+		conn.Close() //nolint:errcheck
+		return nil, fmt.Errorf("send interested: %w", err)
+	}
+
+	sess := &peerSession{peer: peer, conn: conn}
+	for i := 0; i < 32; i++ {
+		msg, err := protocol.ReadMessage(conn)
+		if err != nil {
+			conn.Close() //nolint:errcheck
+			return nil, fmt.Errorf("session setup read: %w", err)
+		}
+		switch msg.ID {
+		case protocol.MsgBitfield:
+			sess.bitfield = append([]byte(nil), msg.Payload...)
+		case protocol.MsgHave:
+			if len(msg.Payload) >= 4 {
+				idx := parseHaveIndex(msg.Payload)
+				setBitfieldPiece(&sess.bitfield, idx)
+			}
+		case protocol.MsgUnchoke:
+			sess.unchoked = true
+			return sess, nil
+		case protocol.MsgChoke:
+			conn.Close() //nolint:errcheck
+			return nil, fmt.Errorf("peer choked us")
+		}
+	}
+
+	if !sess.unchoked {
+		conn.Close() //nolint:errcheck
+		return nil, fmt.Errorf("peer did not unchoke")
+	}
+	return sess, nil
+}
+
+func downloadPieceFromSession(sess *peerSession, torrent *types.TorrentFile, pieceIdx int) ([]byte, error) {
+	if len(sess.bitfield) > 0 && !bitfieldHasPiece(sess.bitfield, pieceIdx) {
+		return nil, errPeerMissingPiece
+	}
+
+	pieceSize := pieceLengthAt(torrent, pieceIdx)
+	pieceData := make([]byte, pieceSize)
+
+	inflight := make(map[uint32]uint32)
+	nextBegin := uint32(0)
+	written := 0
+
+	for written < pieceSize {
+		for len(inflight) < 5 && int(nextBegin) < pieceSize {
+			blockLen := blockSize
+			if int(nextBegin)+blockLen > pieceSize {
+				blockLen = pieceSize - int(nextBegin)
+			}
+			if err := protocol.SendMessage(sess.conn, protocol.RequestMessage(uint32(pieceIdx), nextBegin, uint32(blockLen))); err != nil {
+				return nil, fmt.Errorf("send request: %w", err)
+			}
+			inflight[nextBegin] = uint32(blockLen)
+			nextBegin += uint32(blockLen)
+		}
+
+		msg, err := protocol.ReadMessage(sess.conn)
+		if err != nil {
+			return nil, fmt.Errorf("read piece: %w", err)
+		}
+		switch msg.ID {
+		case protocol.MsgPiece:
+			idx, off, block, err := protocol.ParsePieceMessage(msg.Payload)
+			if err != nil {
+				return nil, err
+			}
+			if idx != uint32(pieceIdx) {
+				continue
+			}
+			expectLen, ok := inflight[off]
+			if !ok {
+				continue
+			}
+			if uint32(len(block)) != expectLen {
+				return nil, fmt.Errorf("short block for piece %d off %d", pieceIdx, off)
+			}
+			copy(pieceData[off:off+uint32(len(block))], block)
+			delete(inflight, off)
+			written += len(block)
+		case protocol.MsgHave:
+			if len(msg.Payload) >= 4 {
+				idx := parseHaveIndex(msg.Payload)
+				setBitfieldPiece(&sess.bitfield, idx)
+			}
+		case protocol.MsgBitfield:
+			sess.bitfield = append([]byte(nil), msg.Payload...)
+			if !bitfieldHasPiece(sess.bitfield, pieceIdx) {
+				return nil, errPeerMissingPiece
+			}
+		case protocol.MsgChoke:
+			return nil, fmt.Errorf("peer choked during piece transfer")
+		}
+	}
+
+	hash := sha1.Sum(pieceData)
+	if hash != torrent.Info.PieceHashes[pieceIdx] {
+		return nil, fmt.Errorf("piece %d hash mismatch", pieceIdx)
+	}
+
+	return pieceData, nil
 }
 
 // downloadPieceFromPeer downloads a specific piece from a peer.
-func downloadPieceFromPeer(peer *types.Peer, torrent *types.TorrentFile, pieceIdx int, pieces [][]byte, mu *sync.Mutex, peerID [20]byte) error {
-	conn, err := ConnectToPeer(*peer)
+func downloadPieceFromPeer(peer types.Peer, torrent *types.TorrentFile, pieceIdx int, peerID [20]byte) ([]byte, error) {
+	conn, err := ConnectToPeer(peer)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer conn.Close()
 
 	// Perform handshake
 	_, err = protocol.Handshake(conn, torrent.InfoHash, peerID)
 	if err != nil {
-		return fmt.Errorf("handshake failed: %v", err)
+		return nil, fmt.Errorf("handshake failed: %v", err)
 	}
 
 	// Send interested message
 	if err := protocol.SendMessage(conn, protocol.InterestedMessage()); err != nil {
-		return fmt.Errorf("failed to send interested: %v", err)
+		return nil, fmt.Errorf("failed to send interested: %v", err)
 	}
+
+	haveSignal := false
 
 	// Wait for unchoke
 	for {
 		msg, err := protocol.ReadMessage(conn)
 		if err != nil {
-			return fmt.Errorf("error reading message: %v", err)
+			return nil, fmt.Errorf("error reading message: %v", err)
+		}
+
+		if msg.ID == protocol.MsgBitfield {
+			if bitfieldHasPiece(msg.Payload, pieceIdx) {
+				haveSignal = true
+			}
+			continue
+		}
+		if msg.ID == protocol.MsgHave && len(msg.Payload) >= 4 {
+			haveIdx := int(uint32(msg.Payload[0])<<24 | uint32(msg.Payload[1])<<16 | uint32(msg.Payload[2])<<8 | uint32(msg.Payload[3]))
+			if haveIdx == pieceIdx {
+				haveSignal = true
+			}
+			continue
 		}
 
 		if msg.ID == protocol.MsgUnchoke {
 			break
 		} else if msg.ID == protocol.MsgChoke {
-			return fmt.Errorf("peer choked us")
+			return nil, fmt.Errorf("peer choked us")
 		}
 	}
 
-	// Calculate piece size
-	pieceSize := int(torrent.Info.PieceLength)
-	if pieceIdx == len(torrent.Info.PieceHashes)-1 {
-		// Last piece might be smaller
-		lastPieceSize := int(torrent.Info.Length % torrent.Info.PieceLength)
-		if lastPieceSize > 0 {
-			pieceSize = lastPieceSize
-		}
+	if !haveSignal {
+		return nil, fmt.Errorf("peer did not advertise piece %d", pieceIdx)
 	}
+
+	// Calculate piece size
+	pieceSize := pieceLengthAt(torrent, pieceIdx)
 
 	// Download the piece in blocks
 	pieceData := make([]byte, pieceSize)
@@ -169,20 +758,20 @@ func downloadPieceFromPeer(peer *types.Peer, torrent *types.TorrentFile, pieceId
 		// Request block
 		reqMsg := protocol.RequestMessage(uint32(pieceIdx), uint32(begin), uint32(blockLen))
 		if err := protocol.SendMessage(conn, reqMsg); err != nil {
-			return fmt.Errorf("failed to send request: %v", err)
+			return nil, fmt.Errorf("failed to send request: %v", err)
 		}
 
 		// Read piece message
 		for {
 			msg, err := protocol.ReadMessage(conn)
 			if err != nil {
-				return fmt.Errorf("error reading message: %v", err)
+				return nil, fmt.Errorf("error reading message: %v", err)
 			}
 
 			if msg.ID == protocol.MsgPiece {
 				idx, off, block, err := protocol.ParsePieceMessage(msg.Payload)
 				if err != nil {
-					return err
+					return nil, err
 				}
 
 				if idx == uint32(pieceIdx) && off == uint32(begin) {
@@ -196,66 +785,317 @@ func downloadPieceFromPeer(peer *types.Peer, torrent *types.TorrentFile, pieceId
 	// Verify hash
 	hash := sha1.Sum(pieceData)
 	if hash != torrent.Info.PieceHashes[pieceIdx] {
-		return fmt.Errorf("piece %d hash mismatch", pieceIdx)
+		return nil, fmt.Errorf("piece %d hash mismatch", pieceIdx)
 	}
 
-	// Store the piece
-	mu.Lock()
-	pieces[pieceIdx] = pieceData
-	mu.Unlock()
-
-	return nil
+	return pieceData, nil
 }
 
-// AssembleFile assembles downloaded pieces into the final file.
-func AssembleFile(pieces [][]byte, torrent *types.TorrentFile) error {
-	fmt.Println("Creating the downloadable file")
-
-	// Save downloads to the user's Downloads folder when available.
+func outputFilePath(torrent *types.TorrentFile) (string, error) {
 	outputDir := os.Getenv("HOME")
 	if outputDir == "" {
 		outputDir = "."
 	} else {
-		outputDir = fmt.Sprintf("%s/Downloads", outputDir)
+		outputDir = filepath.Join(outputDir, "Downloads")
 	}
-
-	// Ensure the output directory exists.
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create output directory: %v", err)
+		return "", fmt.Errorf("create output directory: %w", err)
 	}
 
-	var outputFileName string
+	name := fmt.Sprintf("downloaded_%x.bin", torrent.InfoHash[:8])
 	if len(torrent.Info.Files) > 0 {
-		// Multi-file torrent - use first file name
-		outputFileName = torrent.Info.Files[0].Path[len(torrent.Info.Files[0].Path)-1]
-	} else {
-		// Single file torrent - use a generic name
-		outputFileName = fmt.Sprintf("downloaded_%x", torrent.InfoHash[:8])
+		last := torrent.Info.Files[0].Path[len(torrent.Info.Files[0].Path)-1]
+		if strings.TrimSpace(last) != "" {
+			name = last
+		}
+	}
+	return filepath.Join(outputDir, name), nil
+}
+
+func prepareOutputAndState(outputPath, statePath string, torrent *types.TorrentFile) (*os.File, []bool, int, error) {
+	numPieces := len(torrent.Info.PieceHashes)
+	completed := make([]bool, numPieces)
+
+	if st, err := loadResumeState(statePath); err == nil && len(st.Completed) == numPieces {
+		copy(completed, st.Completed)
 	}
 
-	outputFilePath := fmt.Sprintf("%s/%s", outputDir, outputFileName)
-
-	outputFile, err := os.Create(outputFilePath)
+	file, err := os.OpenFile(outputPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return fmt.Errorf("failed to create output file: %v", err)
+		return nil, nil, 0, fmt.Errorf("open output file: %w", err)
 	}
-	defer outputFile.Close()
-
-	for i, piece := range pieces {
-		if piece == nil {
-			return fmt.Errorf("piece %d is nil", i)
-		}
-
-		_, err := outputFile.Write(piece)
-		if err != nil {
-			return fmt.Errorf("failed to write to output file: %v", err)
-		}
-
-		fmt.Printf("Wrote piece %d (%d bytes)\n", i, len(piece))
+	if err := file.Truncate(torrent.Info.Length); err != nil {
+		file.Close()
+		return nil, nil, 0, fmt.Errorf("size output file: %w", err)
 	}
 
-	fmt.Printf("File assembled successfully at: %s\n", outputFilePath)
+	remaining := numPieces
+	for i := 0; i < numPieces; i++ {
+		if !completed[i] {
+			continue
+		}
+		ok, err := verifyPieceFromDisk(file, torrent, i)
+		if err != nil || !ok {
+			completed[i] = false
+			continue
+		}
+		remaining--
+	}
+
+	if err := saveResumeState(statePath, completed); err != nil {
+		file.Close()
+		return nil, nil, 0, err
+	}
+
+	return file, completed, remaining, nil
+}
+
+func pieceLengthAt(torrent *types.TorrentFile, pieceIdx int) int {
+	pieceSize := int(torrent.Info.PieceLength)
+	if pieceIdx == len(torrent.Info.PieceHashes)-1 {
+		lastPieceSize := int(torrent.Info.Length % torrent.Info.PieceLength)
+		if lastPieceSize > 0 {
+			pieceSize = lastPieceSize
+		}
+	}
+	return pieceSize
+}
+
+func pieceOffset(torrent *types.TorrentFile, pieceIdx int) int64 {
+	return int64(pieceIdx) * torrent.Info.PieceLength
+}
+
+func writePiece(file *os.File, torrent *types.TorrentFile, pieceIdx int, pieceData []byte) error {
+	if len(pieceData) != pieceLengthAt(torrent, pieceIdx) {
+		return fmt.Errorf("piece %d invalid size: got %d", pieceIdx, len(pieceData))
+	}
+	_, err := file.WriteAt(pieceData, pieceOffset(torrent, pieceIdx))
+	if err != nil {
+		return fmt.Errorf("write piece %d: %w", pieceIdx, err)
+	}
 	return nil
+}
+
+func verifyPieceFromDisk(file *os.File, torrent *types.TorrentFile, pieceIdx int) (bool, error) {
+	pieceData := make([]byte, pieceLengthAt(torrent, pieceIdx))
+	_, err := file.ReadAt(pieceData, pieceOffset(torrent, pieceIdx))
+	if err != nil {
+		return false, err
+	}
+	return sha1.Sum(pieceData) == torrent.Info.PieceHashes[pieceIdx], nil
+}
+
+func saveResumeState(path string, completed []bool) error {
+	st := resumeState{Completed: completed}
+	data, err := json.Marshal(st)
+	if err != nil {
+		return fmt.Errorf("marshal resume state: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return fmt.Errorf("write temp state: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replace state file: %w", err)
+	}
+	return nil
+}
+
+func loadResumeState(path string) (*resumeState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var st resumeState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+func allPiecesComplete(completed []bool) bool {
+	for _, ok := range completed {
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func buildTrackerList(tf *types.TorrentFile) []string {
+	seen := make(map[string]struct{})
+	var list []string
+	add := func(u string) {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			return
+		}
+		if _, ok := seen[u]; ok {
+			return
+		}
+		seen[u] = struct{}{}
+		list = append(list, u)
+	}
+
+	add(tf.Announce)
+	for _, tier := range tf.AnnounceList {
+		for _, tr := range tier {
+			add(tr)
+		}
+	}
+	return list
+}
+
+func bitfieldHasPiece(bitfield []byte, pieceIdx int) bool {
+	byteIdx := pieceIdx / 8
+	if byteIdx < 0 || byteIdx >= len(bitfield) {
+		return false
+	}
+	bit := uint(7 - (pieceIdx % 8))
+	return ((bitfield[byteIdx] >> bit) & 1) == 1
+}
+
+func probePeerBitfield(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte) ([]byte, error) {
+	conn, err := ConnectToPeer(peer)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if _, err := protocol.Handshake(conn, torrent.InfoHash, peerID); err != nil {
+		return nil, err
+	}
+
+	for i := 0; i < 8; i++ {
+		msg, err := protocol.ReadMessage(conn)
+		if err != nil {
+			return nil, err
+		}
+		if msg.ID == protocol.MsgBitfield {
+			return msg.Payload, nil
+		}
+	}
+	return nil, fmt.Errorf("no bitfield")
+}
+
+func buildRarestFirstOrder(torrent *types.TorrentFile, peers []types.Peer, peerID [20]byte) []int {
+	n := len(torrent.Info.PieceHashes)
+	if n == 0 {
+		return nil
+	}
+
+	availability := make([]int, n)
+	probeLimit := len(peers)
+	if probeLimit > 24 {
+		probeLimit = 24
+	}
+
+	for i := 0; i < probeLimit; i++ {
+		bf, err := probePeerBitfield(peers[i], torrent, peerID)
+		if err != nil || len(bf) == 0 {
+			continue
+		}
+		for pieceIdx := 0; pieceIdx < n; pieceIdx++ {
+			if bitfieldHasPiece(bf, pieceIdx) {
+				availability[pieceIdx]++
+			}
+		}
+	}
+
+	order := make([]int, n)
+	for i := 0; i < n; i++ {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool {
+		ai := availability[order[i]]
+		aj := availability[order[j]]
+		if ai == aj {
+			return order[i] < order[j]
+		}
+		if ai == 0 {
+			return false
+		}
+		if aj == 0 {
+			return true
+		}
+		return ai < aj
+	})
+
+	return order
+}
+
+func parseHaveIndex(payload []byte) int {
+	if len(payload) < 4 {
+		return -1
+	}
+	return int(uint32(payload[0])<<24 | uint32(payload[1])<<16 | uint32(payload[2])<<8 | uint32(payload[3]))
+}
+
+func setBitfieldPiece(bitfield *[]byte, pieceIdx int) {
+	if pieceIdx < 0 {
+		return
+	}
+	byteIdx := pieceIdx / 8
+	if byteIdx < 0 {
+		return
+	}
+	if len(*bitfield) <= byteIdx {
+		grown := make([]byte, byteIdx+1)
+		copy(grown, *bitfield)
+		*bitfield = grown
+	}
+	bit := uint(7 - (pieceIdx % 8))
+	(*bitfield)[byteIdx] |= (1 << bit)
+}
+
+func discoveryLoop(ctx context.Context, torrent *types.TorrentFile, trackers []string, peerID [20]byte, addPeer func(types.Peer)) {
+	fetch := func() {
+		for _, tr := range trackers {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			switch {
+			case strings.HasPrefix(tr, "udp://"):
+				pp, err := tracker.AnnounceUDP(tr, torrent.InfoHash, peerID, 6881)
+				if err == nil {
+					for _, p := range pp {
+						addPeer(p)
+					}
+				}
+			case strings.HasPrefix(tr, "http://"), strings.HasPrefix(tr, "https://"):
+				tfCopy := *torrent
+				tfCopy.Announce = tr
+				pp, err := tracker.AnnounceToHTTPTracker(&tfCopy, peerID)
+				if err == nil {
+					for _, p := range pp {
+						addPeer(p)
+					}
+				}
+			}
+		}
+
+		pp, err := dht.GetPeers(torrent.InfoHash, 120, 20*time.Second)
+		if err == nil {
+			for _, p := range pp {
+				addPeer(p)
+			}
+		}
+	}
+
+	fetch()
+	ticker := time.NewTicker(discoveryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			fetch()
+		}
+	}
 }
 
 // RequestPiece requests a specific piece from the peer (legacy, kept for compatibility).
