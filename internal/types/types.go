@@ -21,8 +21,10 @@ type TorrentFile struct {
 
 // TorrentInfo represents information about the files contained in the .torrent file.
 type TorrentInfo struct {
+	Name        string
 	Length      int64
 	PieceLength int64
+	Private     bool
 	PieceHashes [][20]byte // List of 20-byte SHA-1 hashes for each piece
 	Files       []FileInfo
 }

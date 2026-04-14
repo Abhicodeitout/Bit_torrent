@@ -79,6 +79,14 @@ func OpenTorrentFile(filePath string) (*TorrentFile, error) {
 		torrent.Info.PieceLength = pieceLength
 	}
 
+	if name, ok := infoRaw["name"].(string); ok {
+		torrent.Info.Name = name
+	}
+
+	if privateFlag, ok := infoRaw["private"].(int64); ok && privateFlag == 1 {
+		torrent.Info.Private = true
+	}
+
 	// Parse pieces (concatenated 20-byte hashes)
 	if pieces, ok := infoRaw["pieces"].(string); ok {
 		for i := 0; i < len(pieces); i += 20 {

@@ -222,6 +222,12 @@ func decodeInfoDict(data []byte) (*types.TorrentInfo, error) {
 	}
 
 	info := &types.TorrentInfo{}
+	if name, ok := raw["name"].(string); ok {
+		info.Name = name
+	}
+	if privateFlag, ok := raw["private"].(int64); ok && privateFlag == 1 {
+		info.Private = true
+	}
 
 	if pl, ok := raw["piece length"].(int64); ok {
 		info.PieceLength = pl

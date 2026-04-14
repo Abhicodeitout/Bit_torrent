@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -93,6 +94,14 @@ type poolSnapshot struct {
 	avgLatency      time.Duration
 }
 
+type outputPlan struct {
+	dataPath    string
+	statePath   string
+	displayPath string
+	rootDir     string
+	isMultiFile bool
+}
+
 // ConnectToPeer establishes a connection to the specified peer.
 func ConnectToPeer(peer types.Peer) (net.Conn, error) {
 	address := net.JoinHostPort(peer.IP.String(), fmt.Sprintf("%d", peer.Port))
@@ -121,25 +130,29 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 	}
 
 	numPieces := len(torrent.Info.PieceHashes)
-	outputPath, err := outputFilePath(torrent)
+	plan, err := buildOutputPlan(torrent)
 	if err != nil {
 		return err
 	}
-	statePath := outputPath + ".state.json"
 
-	file, completed, remaining, err := prepareOutputAndState(outputPath, statePath, torrent)
+	file, completed, remaining, err := prepareOutputAndState(plan.dataPath, plan.statePath, torrent)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
 	if remaining == 0 {
-		os.Remove(statePath) //nolint:errcheck
-		logf("Already complete: %s\n", outputPath)
+		if plan.isMultiFile {
+			if err := materializeMultiFile(plan.dataPath, plan.rootDir, torrent); err != nil {
+				return err
+			}
+		}
+		os.Remove(plan.statePath) //nolint:errcheck
+		logf("Already complete: %s\n", plan.displayPath)
 		return nil
 	}
 
-	logf("Downloading %d/%d pieces to %s\n", remaining, numPieces, outputPath)
+	logf("Downloading %d/%d pieces to %s\n", remaining, numPieces, plan.displayPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -155,7 +168,7 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 	saveState := func() {
 		stateMu.Lock()
 		defer stateMu.Unlock()
-		if err := saveResumeState(statePath, completed); err != nil {
+		if err := saveResumeState(plan.statePath, completed); err != nil {
 			logf("state save failed: %v\n", err)
 		}
 	}
@@ -377,17 +390,25 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 	saveState()
 
 	if !allPiecesComplete(completed) {
-		return fmt.Errorf("download incomplete, resume file kept: %s", statePath)
+		return fmt.Errorf("download incomplete, resume file kept: %s", plan.statePath)
 	}
 
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("sync output file: %w", err)
 	}
-	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+	if plan.isMultiFile {
+		if err := materializeMultiFile(plan.dataPath, plan.rootDir, torrent); err != nil {
+			return err
+		}
+		if err := os.Remove(plan.dataPath); err != nil && !os.IsNotExist(err) {
+			logf("warning: failed to remove payload data file: %v\n", err)
+		}
+	}
+	if err := os.Remove(plan.statePath); err != nil && !os.IsNotExist(err) {
 		logf("warning: failed to remove state file: %v\n", err)
 	}
 
-	logf("Download complete: %s\n", outputPath)
+	logf("Download complete: %s\n", plan.displayPath)
 	return nil
 }
 
@@ -791,25 +812,107 @@ func downloadPieceFromPeer(peer types.Peer, torrent *types.TorrentFile, pieceIdx
 	return pieceData, nil
 }
 
-func outputFilePath(torrent *types.TorrentFile) (string, error) {
-	outputDir := os.Getenv("HOME")
-	if outputDir == "" {
-		outputDir = "."
+func buildOutputPlan(torrent *types.TorrentFile) (*outputPlan, error) {
+	baseDir := os.Getenv("HOME")
+	if baseDir == "" {
+		baseDir = "."
 	} else {
-		outputDir = filepath.Join(outputDir, "Downloads")
+		baseDir = filepath.Join(baseDir, "Downloads")
 	}
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return "", fmt.Errorf("create output directory: %w", err)
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create output directory: %w", err)
 	}
 
-	name := fmt.Sprintf("downloaded_%x.bin", torrent.InfoHash[:8])
-	if len(torrent.Info.Files) > 0 {
-		last := torrent.Info.Files[0].Path[len(torrent.Info.Files[0].Path)-1]
-		if strings.TrimSpace(last) != "" {
-			name = last
+	fallbackName := fmt.Sprintf("downloaded_%x", torrent.InfoHash[:8])
+	name := strings.TrimSpace(torrent.Info.Name)
+	if name == "" {
+		if len(torrent.Info.Files) == 0 {
+			name = fallbackName + ".bin"
+		} else {
+			name = fallbackName
 		}
 	}
-	return filepath.Join(outputDir, name), nil
+
+	if len(torrent.Info.Files) == 0 {
+		dataPath := filepath.Join(baseDir, name)
+		return &outputPlan{
+			dataPath:    dataPath,
+			statePath:   dataPath + ".state.json",
+			displayPath: dataPath,
+			rootDir:     baseDir,
+			isMultiFile: false,
+		}, nil
+	}
+
+	rootDir := filepath.Join(baseDir, name)
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create torrent output directory: %w", err)
+	}
+
+	return &outputPlan{
+		dataPath:    filepath.Join(rootDir, ".torrent-client.payload"),
+		statePath:   filepath.Join(rootDir, ".torrent-client.state.json"),
+		displayPath: rootDir,
+		rootDir:     rootDir,
+		isMultiFile: true,
+	}, nil
+}
+
+func materializeMultiFile(dataPath, rootDir string, torrent *types.TorrentFile) error {
+	payload, err := os.Open(dataPath)
+	if err != nil {
+		return fmt.Errorf("open payload file: %w", err)
+	}
+	defer payload.Close()
+
+	var offset int64
+	for idx, f := range torrent.Info.Files {
+		if f.Length < 0 {
+			return fmt.Errorf("invalid negative file length at index %d", idx)
+		}
+		parts := sanitizePathParts(f.Path)
+		if len(parts) == 0 {
+			parts = []string{fmt.Sprintf("file_%d.bin", idx)}
+		}
+		dst := filepath.Join(append([]string{rootDir}, parts...)...)
+
+		dir := filepath.Dir(dst)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create directory for %s: %w", dst, err)
+		}
+
+		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return fmt.Errorf("create output file %s: %w", dst, err)
+		}
+
+		section := io.NewSectionReader(payload, offset, f.Length)
+		if _, err := io.CopyN(out, section, f.Length); err != nil {
+			out.Close()
+			return fmt.Errorf("write output file %s: %w", dst, err)
+		}
+		if err := out.Close(); err != nil {
+			return fmt.Errorf("close output file %s: %w", dst, err)
+		}
+
+		offset += f.Length
+	}
+
+	return nil
+}
+
+func sanitizePathParts(parts []string) []string {
+	clean := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" || p == "." || p == ".." {
+			continue
+		}
+		p = strings.ReplaceAll(p, "\\", "_")
+		p = strings.ReplaceAll(p, "/", "_")
+		clean = append(clean, p)
+	}
+	return clean
 }
 
 func prepareOutputAndState(outputPath, statePath string, torrent *types.TorrentFile) (*os.File, []bool, int, error) {
@@ -1077,10 +1180,12 @@ func discoveryLoop(ctx context.Context, torrent *types.TorrentFile, trackers []s
 			}
 		}
 
-		pp, err := dht.GetPeers(torrent.InfoHash, 120, 20*time.Second)
-		if err == nil {
-			for _, p := range pp {
-				addPeer(p)
+		if !torrent.Info.Private {
+			pp, err := dht.GetPeers(torrent.InfoHash, 120, 20*time.Second)
+			if err == nil {
+				for _, p := range pp {
+					addPeer(p)
+				}
 			}
 		}
 	}

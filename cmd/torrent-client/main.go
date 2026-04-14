@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -62,6 +63,13 @@ func main() {
 		torrentFile = &types.TorrentFile{InfoHash: magnet.InfoHash}
 
 		peers = gatherPeers(magnet.InfoHash, magnet.Trackers, torrentFile, peerID)
+		if len(magnet.PeerAddrs) > 0 {
+			for _, raw := range magnet.PeerAddrs {
+				if p, ok := parsePeerAddr(raw); ok {
+					peers = append(peers, p)
+				}
+			}
+		}
 		if len(peers) == 0 {
 			fmt.Println("No peers from trackers — trying DHT (BEP 5)...")
 			dhtPeers, err := dht.GetPeers(magnet.InfoHash, 50, 45*time.Second)
@@ -85,6 +93,9 @@ func main() {
 		torrentFile.Info = *info
 		fmt.Printf("Metadata ready: %d pieces, %d bytes total\n",
 			len(info.PieceHashes), info.Length)
+		if info.Private {
+			fmt.Println("Metadata indicates private torrent; DHT discovery is disabled for download phase.")
+		}
 
 	} else {
 		// ── Torrent file ──────────────────────────────────────────────────────
@@ -101,10 +112,12 @@ func main() {
 
 		trackers := buildTrackerList(torrentFile)
 		peers = gatherPeers(torrentFile.InfoHash, trackers, torrentFile, peerID)
-		if len(peers) < 5 {
+		if len(peers) < 5 && !torrentFile.Info.Private {
 			fmt.Printf("Only %d tracker peer(s) — also querying DHT...\n", len(peers))
 			dhtPeers, _ := dht.GetPeers(torrentFile.InfoHash, 50, 30*time.Second)
 			peers = append(peers, dhtPeers...)
+		} else if len(peers) < 5 && torrentFile.Info.Private {
+			fmt.Printf("Only %d tracker peer(s) and torrent is private; skipping DHT.\n", len(peers))
 		}
 	}
 
@@ -173,5 +186,17 @@ func gatherPeers(infoHash [20]byte, trackers []string, tf *types.TorrentFile, pe
 		}
 	}
 	return peers
+}
+
+func parsePeerAddr(raw string) (types.Peer, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return types.Peer{}, false
+	}
+	addr, err := net.ResolveTCPAddr("tcp", raw)
+	if err != nil || addr == nil || addr.IP == nil || addr.Port <= 0 || addr.Port > 65535 {
+		return types.Peer{}, false
+	}
+	return types.Peer{IP: addr.IP, Port: uint16(addr.Port)}, true
 }
 
