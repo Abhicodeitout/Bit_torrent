@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"torrent-client/internal/dht"
@@ -52,6 +53,10 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var downloadedBytes atomic.Int64
+	var uploadedBytes atomic.Int64
+	var leftBytes atomic.Int64
+
 	var torrentFile *types.TorrentFile
 	var peers []types.Peer
 	var trackerURLs []string
@@ -69,12 +74,6 @@ func main() {
 		// Minimal struct used only for tracker HTTP announces (needs InfoHash).
 		torrentFile = &types.TorrentFile{InfoHash: magnet.InfoHash}
 		trackerURLs = magnet.Trackers
-
-		go func() {
-			if err := peerpkg.StartInboundListener(ctx, magnet.InfoHash, peerID, opts.ListenPort, opts.Verbose); err != nil && opts.Verbose {
-				fmt.Printf("Inbound listener error: %v\n", err)
-			}
-		}()
 
 		peers = gatherPeers(magnet.InfoHash, trackerURLs, torrentFile, peerID, opts.ListenPort, "started")
 		if len(magnet.PeerAddrs) > 0 {
@@ -105,11 +104,29 @@ func main() {
 			os.Exit(1)
 		}
 		torrentFile.Info = *info
+		leftBytes.Store(info.Length)
 		fmt.Printf("Metadata ready: %d pieces, %d bytes total\n",
 			len(info.PieceHashes), info.Length)
 		if info.Private {
 			fmt.Println("Metadata indicates private torrent; DHT discovery is disabled for download phase.")
 		}
+
+		provider, _ := downloader.OpenSeedStore(torrentFile)
+		if provider != nil {
+			defer provider.Close() //nolint:errcheck
+		}
+		go func() {
+			err := peerpkg.StartInboundListener(ctx, magnet.InfoHash, peerID, opts.ListenPort, peerpkg.ListenerOptions{
+				Verbose:  opts.Verbose,
+				Provider: provider,
+				OnUploaded: func(bytes int) {
+					uploadedBytes.Add(int64(bytes))
+				},
+			})
+			if err != nil && opts.Verbose {
+				fmt.Printf("Inbound listener error: %v\n", err)
+			}
+		}()
 
 	} else {
 		// ── Torrent file ──────────────────────────────────────────────────────
@@ -123,11 +140,23 @@ func main() {
 			torrentFile.InfoHash,
 			len(torrentFile.Info.PieceHashes),
 			torrentFile.Info.Length)
+		leftBytes.Store(torrentFile.Info.Length)
 
 		trackers := buildTrackerList(torrentFile)
 		trackerURLs = trackers
+		provider, _ := downloader.OpenSeedStore(torrentFile)
+		if provider != nil {
+			defer provider.Close() //nolint:errcheck
+		}
 		go func() {
-			if err := peerpkg.StartInboundListener(ctx, torrentFile.InfoHash, peerID, opts.ListenPort, opts.Verbose); err != nil && opts.Verbose {
+			err := peerpkg.StartInboundListener(ctx, torrentFile.InfoHash, peerID, opts.ListenPort, peerpkg.ListenerOptions{
+				Verbose:  opts.Verbose,
+				Provider: provider,
+				OnUploaded: func(bytes int) {
+					uploadedBytes.Add(int64(bytes))
+				},
+			})
+			if err != nil && opts.Verbose {
 				fmt.Printf("Inbound listener error: %v\n", err)
 			}
 		}()
@@ -146,13 +175,60 @@ func main() {
 		os.Exit(1)
 	}
 
+	opts.ProgressHook = func(downloaded, left int64) {
+		downloadedBytes.Store(downloaded)
+		leftBytes.Store(left)
+	}
+
+	if len(trackerURLs) > 0 {
+		go func() {
+			ticker := time.NewTicker(4 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					announceLifecycleEventWithStats(
+						trackerURLs,
+						torrentFile,
+						peerID,
+						opts.ListenPort,
+						"",
+						downloadedBytes.Load(),
+						uploadedBytes.Load(),
+						leftBytes.Load(),
+					)
+				}
+			}
+		}()
+	}
+
 	fmt.Printf("Starting download from %d peers...\n", len(peers))
-	defer announceLifecycleEvent(trackerURLs, torrentFile, peerID, opts.ListenPort, "stopped", 0)
+	defer announceLifecycleEventWithStats(
+		trackerURLs,
+		torrentFile,
+		peerID,
+		opts.ListenPort,
+		"stopped",
+		downloadedBytes.Load(),
+		uploadedBytes.Load(),
+		leftBytes.Load(),
+	)
 	if err := downloader.DownloadTorrentWithOptions(torrentFile, peers, peerID, opts); err != nil {
 		fmt.Println("Download failed:", err)
 		os.Exit(1)
 	}
-	announceLifecycleEvent(trackerURLs, torrentFile, peerID, opts.ListenPort, "completed", 0)
+	announceLifecycleEventWithStats(
+		trackerURLs,
+		torrentFile,
+		peerID,
+		opts.ListenPort,
+		"completed",
+		downloadedBytes.Load(),
+		uploadedBytes.Load(),
+		0,
+	)
 }
 
 // buildTrackerList returns a deduplicated, flat list of all tracker URLs from a
@@ -229,16 +305,18 @@ func parsePeerAddr(raw string) (types.Peer, bool) {
 	return types.Peer{IP: addr.IP, Port: uint16(addr.Port)}, true
 }
 
-func announceLifecycleEvent(trackers []string, tf *types.TorrentFile, peerID [20]byte, port uint16, event string, left int64) {
+func announceLifecycleEventWithStats(trackers []string, tf *types.TorrentFile, peerID [20]byte, port uint16, event string, downloaded, uploaded, left int64) {
 	if tf == nil || len(trackers) == 0 {
 		return
 	}
 	req := tracker.AnnounceRequest{
-		InfoHash: tf.InfoHash,
-		PeerID:   peerID,
-		Port:     port,
-		Left:     left,
-		Event:    event,
+		InfoHash:   tf.InfoHash,
+		PeerID:     peerID,
+		Port:       port,
+		Downloaded: downloaded,
+		Uploaded:   uploaded,
+		Left:       left,
+		Event:      event,
 	}
 	for _, tr := range trackers {
 		switch {

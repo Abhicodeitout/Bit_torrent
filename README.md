@@ -31,6 +31,8 @@ A fully functional, production-ready BitTorrent client written in Go — support
 | Continuous peer discovery | ✅ | Trackers + DHT queried during active download |
 | Inbound peer listener | ✅ | Configurable listen port for incoming peer handshakes |
 | Tracker lifecycle events | ✅ | `started`, periodic announce, `completed`, `stopped` |
+| Basic upload serving | ✅ | Serves available pieces to inbound peers via request/piece messages |
+| Tracker progress counters | ✅ | Announces live `downloaded`, `left`, and `uploaded` values |
 | Rarest-first + endgame mode | ✅ | Better swarm efficiency and tail completion |
 | Concurrent downloading | ✅ | Configured worker pool with long-lived peer sessions |
 | Runtime telemetry | ✅ | Piece/peer stats during download, toggleable |
@@ -90,7 +92,7 @@ Optional runtime flags:
 2. Load existing resume state (if present) and verify completed pieces from disk
 3. Start inbound listener on the configured `--listen-port`
 4. Contact HTTP/UDP trackers (plus DHT only when torrent is not private) to seed the peer pool
-5. Announce tracker lifecycle (`started` at begin, `completed`/`stopped` at end)
+5. Announce tracker lifecycle (`started`, periodic progress announces, `completed`/`stopped`)
 6. Start adaptive workers with long-lived peer sessions and pipelined block requests
 7. Continue peer discovery in the background while downloading
 8. SHA-1 verify every piece, write directly to output offsets, and persist state
@@ -172,6 +174,7 @@ User input (.torrent file or magnet link)
                     │  • Long-lived sessions + pipelined requests │
                     │  • Adaptive peer scoring/backoff/quarantine │
                     │  • Inbound peer listener on configured port │
+                    │  • Serves piece blocks to inbound peers     │
                     │  • Endgame duplication near completion      │
                     └───────────────────────┬────────────────────┘
                                             │

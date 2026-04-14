@@ -188,6 +188,26 @@ func RequestMessage(index, begin, length uint32) Message {
 	}
 }
 
+// ParseRequestMessage parses a request message payload.
+func ParseRequestMessage(payload []byte) (index, begin, length uint32, err error) {
+	if len(payload) != 12 {
+		return 0, 0, 0, fmt.Errorf("invalid request message length: %d", len(payload))
+	}
+	index = binary.BigEndian.Uint32(payload[0:4])
+	begin = binary.BigEndian.Uint32(payload[4:8])
+	length = binary.BigEndian.Uint32(payload[8:12])
+	return
+}
+
+// PieceMessage creates a piece message payload for a requested block.
+func PieceMessage(index, begin uint32, block []byte) Message {
+	payload := make([]byte, 8+len(block))
+	binary.BigEndian.PutUint32(payload[0:4], index)
+	binary.BigEndian.PutUint32(payload[4:8], begin)
+	copy(payload[8:], block)
+	return Message{ID: MsgPiece, Payload: payload}
+}
+
 // ParsePieceMessage parses a piece message.
 func ParsePieceMessage(payload []byte) (index, begin uint32, block []byte, err error) {
 	if len(payload) < 8 {

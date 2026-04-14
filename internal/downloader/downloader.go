@@ -43,17 +43,19 @@ type resumeState struct {
 
 // DownloadOptions controls downloader runtime logging behavior.
 type DownloadOptions struct {
-	Verbose     bool
-	EnableStats bool
-	ListenPort  uint16
+	Verbose      bool
+	EnableStats  bool
+	ListenPort   uint16
+	ProgressHook func(downloaded, left int64)
 }
 
 // DefaultDownloadOptions returns defaults suitable for interactive CLI runs.
 func DefaultDownloadOptions() DownloadOptions {
 	return DownloadOptions{
-		Verbose:     true,
-		EnableStats: true,
-		ListenPort:  6881,
+		Verbose:      true,
+		EnableStats:  true,
+		ListenPort:   6881,
+		ProgressHook: nil,
 	}
 }
 
@@ -102,6 +104,13 @@ type outputPlan struct {
 	displayPath string
 	rootDir     string
 	isMultiFile bool
+}
+
+// SeedStore serves locally available piece data to inbound peers.
+type SeedStore struct {
+	torrent   *types.TorrentFile
+	file      *os.File
+	completed []bool
 }
 
 // ConnectToPeer establishes a connection to the specified peer.
@@ -160,10 +169,23 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 	defer cancel()
 
 	var completedCount int64
+	var downloadedBytes int64
 	for _, ok := range completed {
 		if ok {
 			completedCount++
 		}
+	}
+	for i, ok := range completed {
+		if ok {
+			downloadedBytes += int64(pieceLengthAt(torrent, i))
+		}
+	}
+	if opts.ProgressHook != nil {
+		left := torrent.Info.Length - downloadedBytes
+		if left < 0 {
+			left = 0
+		}
+		opts.ProgressHook(downloadedBytes, left)
 	}
 
 	var stateMu sync.Mutex
@@ -347,6 +369,14 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 							stateMu.Unlock()
 							pieceWG.Done()
 							current := atomic.AddInt64(&completedCount, 1)
+							db := atomic.AddInt64(&downloadedBytes, int64(len(pieceData)))
+							if opts.ProgressHook != nil {
+								left := torrent.Info.Length - db
+								if left < 0 {
+									left = 0
+								}
+								opts.ProgressHook(db, left)
+							}
 							remainingNow := numPieces - int(current)
 							if remainingNow <= endgameThreshold {
 								startEndgame()
@@ -402,9 +432,6 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 		if err := materializeMultiFile(plan.dataPath, plan.rootDir, torrent); err != nil {
 			return err
 		}
-		if err := os.Remove(plan.dataPath); err != nil && !os.IsNotExist(err) {
-			logf("warning: failed to remove payload data file: %v\n", err)
-		}
 	}
 	if err := os.Remove(plan.statePath); err != nil && !os.IsNotExist(err) {
 		logf("warning: failed to remove state file: %v\n", err)
@@ -412,6 +439,78 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 
 	logf("Download complete: %s\n", plan.displayPath)
 	return nil
+}
+
+// OpenSeedStore opens local torrent data for inbound upload serving.
+func OpenSeedStore(torrent *types.TorrentFile) (*SeedStore, error) {
+	if torrent == nil || len(torrent.Info.PieceHashes) == 0 {
+		return nil, fmt.Errorf("invalid torrent for seed store")
+	}
+	plan, err := buildOutputPlan(torrent)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.Open(plan.dataPath)
+	if err != nil {
+		return nil, err
+	}
+	st, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if st.Size() < torrent.Info.Length {
+		file.Close()
+		return nil, fmt.Errorf("seed data file is incomplete")
+	}
+
+	completed := make([]bool, len(torrent.Info.PieceHashes))
+	if rs, err := loadResumeState(plan.statePath); err == nil && len(rs.Completed) == len(completed) {
+		copy(completed, rs.Completed)
+	} else {
+		for i := range completed {
+			completed[i] = true
+		}
+	}
+
+	return &SeedStore{torrent: torrent, file: file, completed: completed}, nil
+}
+
+func (s *SeedStore) Close() error {
+	if s == nil || s.file == nil {
+		return nil
+	}
+	return s.file.Close()
+}
+
+func (s *SeedStore) NumPieces() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.completed)
+}
+
+func (s *SeedStore) HasPiece(index int) bool {
+	if s == nil || index < 0 || index >= len(s.completed) {
+		return false
+	}
+	return s.completed[index]
+}
+
+func (s *SeedStore) ReadPiece(index, begin, length int) ([]byte, error) {
+	if s == nil || !s.HasPiece(index) {
+		return nil, fmt.Errorf("piece not available")
+	}
+	pLen := pieceLengthAt(s.torrent, index)
+	if begin < 0 || length <= 0 || begin+length > pLen {
+		return nil, fmt.Errorf("invalid piece range")
+	}
+	b := make([]byte, length)
+	off := pieceOffset(s.torrent, index) + int64(begin)
+	if _, err := s.file.ReadAt(b, off); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func newPeerPool() *peerPool {
