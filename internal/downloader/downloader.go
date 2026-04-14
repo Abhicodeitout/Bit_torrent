@@ -45,6 +45,7 @@ type resumeState struct {
 type DownloadOptions struct {
 	Verbose     bool
 	EnableStats bool
+	ListenPort  uint16
 }
 
 // DefaultDownloadOptions returns defaults suitable for interactive CLI runs.
@@ -52,6 +53,7 @@ func DefaultDownloadOptions() DownloadOptions {
 	return DownloadOptions{
 		Verbose:     true,
 		EnableStats: true,
+		ListenPort:  6881,
 	}
 }
 
@@ -191,7 +193,7 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 	}
 
 	trackers := buildTrackerList(torrent)
-	go discoveryLoop(ctx, torrent, trackers, peerID, seedPeer)
+	go discoveryLoop(ctx, torrent, trackers, peerID, opts.ListenPort, seedPeer)
 
 	go func() {
 		ticker := time.NewTicker(stateSaveInterval)
@@ -1151,7 +1153,7 @@ func setBitfieldPiece(bitfield *[]byte, pieceIdx int) {
 	(*bitfield)[byteIdx] |= (1 << bit)
 }
 
-func discoveryLoop(ctx context.Context, torrent *types.TorrentFile, trackers []string, peerID [20]byte, addPeer func(types.Peer)) {
+func discoveryLoop(ctx context.Context, torrent *types.TorrentFile, trackers []string, peerID [20]byte, listenPort uint16, addPeer func(types.Peer)) {
 	fetch := func() {
 		for _, tr := range trackers {
 			select {
@@ -1162,7 +1164,13 @@ func discoveryLoop(ctx context.Context, torrent *types.TorrentFile, trackers []s
 
 			switch {
 			case strings.HasPrefix(tr, "udp://"):
-				pp, err := tracker.AnnounceUDP(tr, torrent.InfoHash, peerID, 6881)
+				pp, err := tracker.AnnounceUDPWithRequest(tr, tracker.AnnounceRequest{
+					InfoHash: torrent.InfoHash,
+					PeerID:   peerID,
+					Port:     listenPort,
+					Left:     torrent.Info.Length,
+					Event:    "",
+				})
 				if err == nil {
 					for _, p := range pp {
 						addPeer(p)
@@ -1171,7 +1179,13 @@ func discoveryLoop(ctx context.Context, torrent *types.TorrentFile, trackers []s
 			case strings.HasPrefix(tr, "http://"), strings.HasPrefix(tr, "https://"):
 				tfCopy := *torrent
 				tfCopy.Announce = tr
-				pp, err := tracker.AnnounceToHTTPTracker(&tfCopy, peerID)
+				pp, err := tracker.AnnounceToHTTPTrackerWithRequest(&tfCopy, tracker.AnnounceRequest{
+					InfoHash: torrent.InfoHash,
+					PeerID:   peerID,
+					Port:     listenPort,
+					Left:     torrent.Info.Length,
+					Event:    "",
+				})
 				if err == nil {
 					for _, p := range pp {
 						addPeer(p)

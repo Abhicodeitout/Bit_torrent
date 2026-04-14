@@ -10,8 +10,10 @@ import (
 )
 
 const (
-	connTimeout = 10 * time.Second
-	readTimeout = 10 * time.Second
+	connTimeout   = 10 * time.Second
+	readTimeout   = 10 * time.Second
+	handshakePStr = "BitTorrent protocol"
+	handshakeLen  = 68
 )
 
 // Message IDs for the BitTorrent wire protocol
@@ -29,48 +31,56 @@ const (
 
 // Handshake performs the BitTorrent handshake with a peer.
 func Handshake(conn net.Conn, infoHash [20]byte, peerID [20]byte) ([20]byte, error) {
-	// Prepare handshake message
+	if err := WriteHandshake(conn, infoHash, peerID); err != nil {
+		return [20]byte{}, err
+	}
+	return ReadHandshake(conn, infoHash)
+}
+
+// BuildHandshake builds the canonical 68-byte BitTorrent handshake payload.
+func BuildHandshake(infoHash [20]byte, peerID [20]byte) []byte {
 	// Protocol: <pstrlen><pstr><reserved><info_hash><peer_id>
 	handshakeMsg := new(bytes.Buffer)
-
-	// Write protocol name
-	pstr := "BitTorrent protocol"
-	handshakeMsg.WriteByte(byte(len(pstr)))
-	handshakeMsg.WriteString(pstr)
-
-	// Write reserved bytes (8 bytes)
-	reserved := make([]byte, 8)
-	handshakeMsg.Write(reserved)
-
-	// Write info hash
+	handshakeMsg.WriteByte(byte(len(handshakePStr)))
+	handshakeMsg.WriteString(handshakePStr)
+	handshakeMsg.Write(make([]byte, 8))
 	handshakeMsg.Write(infoHash[:])
-
-	// Write peer ID
 	handshakeMsg.Write(peerID[:])
+	return handshakeMsg.Bytes()
+}
 
-	// Send handshake
+// WriteHandshake writes a BitTorrent handshake to conn.
+func WriteHandshake(conn net.Conn, infoHash [20]byte, peerID [20]byte) error {
 	conn.SetWriteDeadline(time.Now().Add(connTimeout))
-	_, err := conn.Write(handshakeMsg.Bytes())
-	if err != nil {
-		return [20]byte{}, fmt.Errorf("failed to send handshake: %v", err)
+	if _, err := conn.Write(BuildHandshake(infoHash, peerID)); err != nil {
+		return fmt.Errorf("failed to send handshake: %v", err)
 	}
+	return nil
+}
 
-	// Receive handshake response
+// ReadHandshake reads and validates a BitTorrent handshake from conn.
+// If expectedInfoHash is non-zero, the incoming info-hash must match.
+func ReadHandshake(conn net.Conn, expectedInfoHash [20]byte) ([20]byte, error) {
 	conn.SetReadDeadline(time.Now().Add(readTimeout))
-	response := make([]byte, 68) // 1 + 19 + 8 + 20 + 20
-	if _, err = io.ReadFull(conn, response); err != nil {
+	response := make([]byte, handshakeLen)
+	if _, err := io.ReadFull(conn, response); err != nil {
 		return [20]byte{}, fmt.Errorf("failed to receive handshake: %v", err)
 	}
 
-	// Verify protocol name
-	if response[0] != byte(len(pstr)) || string(response[1:20]) != pstr {
+	if response[0] != byte(len(handshakePStr)) || string(response[1:20]) != handshakePStr {
 		return [20]byte{}, fmt.Errorf("invalid protocol name in handshake")
 	}
 
-	// Extract peer ID from response
+	if expectedInfoHash != ([20]byte{}) {
+		var recvInfoHash [20]byte
+		copy(recvInfoHash[:], response[28:48])
+		if recvInfoHash != expectedInfoHash {
+			return [20]byte{}, fmt.Errorf("unexpected info hash in handshake")
+		}
+	}
+
 	var remotePeerID [20]byte
 	copy(remotePeerID[:], response[48:68])
-
 	return remotePeerID, nil
 }
 

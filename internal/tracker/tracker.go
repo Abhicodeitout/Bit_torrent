@@ -16,8 +16,42 @@ import (
 	"torrent-client/internal/types"
 )
 
+// AnnounceRequest carries tracker announce lifecycle data.
+type AnnounceRequest struct {
+	InfoHash   [20]byte
+	PeerID     [20]byte
+	Port       uint16
+	Uploaded   int64
+	Downloaded int64
+	Left       int64
+	Event      string // "started", "completed", "stopped", or ""
+}
+
+func udpEventCode(event string) uint32 {
+	switch event {
+	case "completed":
+		return 1
+	case "started":
+		return 2
+	case "stopped":
+		return 3
+	default:
+		return 0
+	}
+}
+
 // AnnounceUDP implements the full UDP tracker protocol (BEP 15).
 func AnnounceUDP(trackerURL string, infoHash [20]byte, peerID [20]byte, port uint16) ([]types.Peer, error) {
+	return AnnounceUDPWithRequest(trackerURL, AnnounceRequest{
+		InfoHash: infoHash,
+		PeerID:   peerID,
+		Port:     port,
+		Event:    "started",
+	})
+}
+
+// AnnounceUDPWithRequest implements UDP tracker announces with lifecycle events.
+func AnnounceUDPWithRequest(trackerURL string, req AnnounceRequest) ([]types.Peer, error) {
 	u, err := url.Parse(trackerURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse UDP tracker URL: %w", err)
@@ -68,14 +102,16 @@ func AnnounceUDP(trackerURL string, infoHash [20]byte, peerID [20]byte, port uin
 	binary.BigEndian.PutUint64(announceReq[0:8], connectionID)
 	binary.BigEndian.PutUint32(announceReq[8:12], 1) // action: announce
 	copy(announceReq[12:16], txID2[:])
-	copy(announceReq[16:36], infoHash[:])
-	copy(announceReq[36:56], peerID[:])
-	// bytes 56-79: downloaded(8), left(8), uploaded(8) — all zero
-	binary.BigEndian.PutUint32(announceReq[80:84], 2) // event: started
+	copy(announceReq[16:36], req.InfoHash[:])
+	copy(announceReq[36:56], req.PeerID[:])
+	binary.BigEndian.PutUint64(announceReq[56:64], uint64(req.Downloaded))
+	binary.BigEndian.PutUint64(announceReq[64:72], uint64(req.Left))
+	binary.BigEndian.PutUint64(announceReq[72:80], uint64(req.Uploaded))
+	binary.BigEndian.PutUint32(announceReq[80:84], udpEventCode(req.Event))
 	// bytes 84-87: IP = 0 (use default)
 	rand.Read(announceReq[88:92])                              //nolint:errcheck  key (random)
 	binary.BigEndian.PutUint32(announceReq[92:96], ^uint32(0)) // num_want: -1
-	binary.BigEndian.PutUint16(announceReq[96:98], port)
+	binary.BigEndian.PutUint16(announceReq[96:98], req.Port)
 
 	if _, err := conn.Write(announceReq); err != nil {
 		return nil, fmt.Errorf("send announce request: %w", err)
@@ -112,20 +148,33 @@ func AnnounceUDP(trackerURL string, infoHash [20]byte, peerID [20]byte, port uin
 
 // AnnounceToHTTPTracker sends an HTTP GET request to the HTTP tracker and retrieves a list of peers.
 func AnnounceToHTTPTracker(torrent *types.TorrentFile, peerID [20]byte) ([]types.Peer, error) {
+	return AnnounceToHTTPTrackerWithRequest(torrent, AnnounceRequest{
+		InfoHash: torrent.InfoHash,
+		PeerID:   peerID,
+		Port:     6881,
+		Left:     torrent.Info.Length,
+		Event:    "started",
+	})
+}
+
+// AnnounceToHTTPTrackerWithRequest sends an HTTP tracker announce with lifecycle fields.
+func AnnounceToHTTPTrackerWithRequest(torrent *types.TorrentFile, req AnnounceRequest) ([]types.Peer, error) {
 	baseURL, err := url.Parse(torrent.Announce)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tracker URL: %v", err)
 	}
 
 	params := url.Values{
-		"info_hash":  {string(torrent.InfoHash[:])},
-		"peer_id":    {string(peerID[:])},
-		"port":       {"6881"},
-		"uploaded":   {"0"},
-		"downloaded": {"0"},
-		"left":       {fmt.Sprintf("%d", torrent.Info.Length)},
+		"info_hash":  {string(req.InfoHash[:])},
+		"peer_id":    {string(req.PeerID[:])},
+		"port":       {fmt.Sprintf("%d", req.Port)},
+		"uploaded":   {fmt.Sprintf("%d", req.Uploaded)},
+		"downloaded": {fmt.Sprintf("%d", req.Downloaded)},
+		"left":       {fmt.Sprintf("%d", req.Left)},
 		"compact":    {"1"}, // Request compact peer list
-		"event":      {"started"},
+	}
+	if req.Event != "" {
+		params.Set("event", req.Event)
 	}
 
 	baseURL.RawQuery = params.Encode()
@@ -228,15 +277,33 @@ func GetPeers(trackerURL string, infoHash [20]byte, peerID [20]byte, torrent *ty
 	case torrent == nil:
 		return nil, fmt.Errorf("nil torrent file")
 	case strings.HasPrefix(trackerURL, "udp://"):
-		return AnnounceUDP(trackerURL, infoHash, peerID, 6881)
+		return AnnounceUDPWithRequest(trackerURL, AnnounceRequest{
+			InfoHash: infoHash,
+			PeerID:   peerID,
+			Port:     6881,
+			Left:     torrent.Info.Length,
+			Event:    "started",
+		})
 	case strings.HasPrefix(trackerURL, "http://"):
 		tfCopy := *torrent
 		tfCopy.Announce = trackerURL
-		return AnnounceToHTTPTracker(&tfCopy, peerID)
+		return AnnounceToHTTPTrackerWithRequest(&tfCopy, AnnounceRequest{
+			InfoHash: infoHash,
+			PeerID:   peerID,
+			Port:     6881,
+			Left:     torrent.Info.Length,
+			Event:    "started",
+		})
 	case strings.HasPrefix(trackerURL, "https://"):
 		tfCopy := *torrent
 		tfCopy.Announce = trackerURL
-		return AnnounceToHTTPTracker(&tfCopy, peerID)
+		return AnnounceToHTTPTrackerWithRequest(&tfCopy, AnnounceRequest{
+			InfoHash: infoHash,
+			PeerID:   peerID,
+			Port:     6881,
+			Left:     torrent.Info.Length,
+			Event:    "started",
+		})
 	default:
 		return nil, fmt.Errorf("unsupported tracker scheme in %q", trackerURL)
 	}

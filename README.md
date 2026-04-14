@@ -29,6 +29,8 @@ A fully functional, production-ready BitTorrent client written in Go — support
 | Disk-backed piece writes | ✅ | No full-file in-memory buffering |
 | Adaptive peer scheduling | ✅ | Peer scoring, backoff, temporary quarantine |
 | Continuous peer discovery | ✅ | Trackers + DHT queried during active download |
+| Inbound peer listener | ✅ | Configurable listen port for incoming peer handshakes |
+| Tracker lifecycle events | ✅ | `started`, periodic announce, `completed`, `stopped` |
 | Rarest-first + endgame mode | ✅ | Better swarm efficiency and tail completion |
 | Concurrent downloading | ✅ | Configured worker pool with long-lived peer sessions |
 | Runtime telemetry | ✅ | Piece/peer stats during download, toggleable |
@@ -73,6 +75,7 @@ Optional runtime flags:
 ```bash
 ./bin/torrent-client --quiet path/to/file.torrent
 ./bin/torrent-client --verbose path/to/file.torrent
+./bin/torrent-client --listen-port 51413 path/to/file.torrent
 ```
 
 **Example:**
@@ -85,11 +88,13 @@ Optional runtime flags:
 
 1. Parse torrent file (bencode) — extracts info hash, piece hashes, trackers, file list
 2. Load existing resume state (if present) and verify completed pieces from disk
-3. Contact HTTP/UDP trackers (plus DHT only when torrent is not private) to seed the peer pool
-4. Start adaptive workers with long-lived peer sessions and pipelined block requests
-5. Continue peer discovery in the background while downloading
-6. SHA-1 verify every piece, write directly to output offsets, and persist state
-7. Enter endgame mode near completion to finish tail pieces faster
+3. Start inbound listener on the configured `--listen-port`
+4. Contact HTTP/UDP trackers (plus DHT only when torrent is not private) to seed the peer pool
+5. Announce tracker lifecycle (`started` at begin, `completed`/`stopped` at end)
+6. Start adaptive workers with long-lived peer sessions and pipelined block requests
+7. Continue peer discovery in the background while downloading
+8. SHA-1 verify every piece, write directly to output offsets, and persist state
+9. Enter endgame mode near completion to finish tail pieces faster
 
 ---
 
@@ -166,6 +171,7 @@ User input (.torrent file or magnet link)
                     │  • Rarest-first scheduling                  │
                     │  • Long-lived sessions + pipelined requests │
                     │  • Adaptive peer scoring/backoff/quarantine │
+                    │  • Inbound peer listener on configured port │
                     │  • Endgame duplication near completion      │
                     └───────────────────────┬────────────────────┘
                                             │
@@ -190,7 +196,8 @@ Bit_torrent/
 │   ├── tracker/
 │   │   └── tracker.go           # HTTP tracker (BEP 3) + UDP tracker (BEP 15)
 │   ├── peer/
-│   │   └── manager.go           # Background peer discovery manager (used by scheduler)
+│   │   ├── manager.go           # Background peer discovery manager (used by scheduler)
+│   │   └── listener.go          # Inbound peer listener + handshake responder
 │   ├── state/
 │   │   └── state.go             # Persistent state helpers
 │   ├── types/

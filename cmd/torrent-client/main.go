@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 
 	"torrent-client/internal/dht"
 	"torrent-client/internal/downloader"
+	peerpkg "torrent-client/internal/peer"
 	"torrent-client/internal/protocol"
 	"torrent-client/internal/tracker"
 	"torrent-client/internal/types"
@@ -19,8 +21,9 @@ func main() {
 	fs := flag.NewFlagSet("torrent-client", flag.ExitOnError)
 	quiet := fs.Bool("quiet", false, "suppress downloader progress/stats output")
 	verbose := fs.Bool("verbose", false, "force verbose downloader progress/stats output")
+	listenPort := fs.Uint("listen-port", 6881, "tcp port to announce and listen on")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: torrent-client [--quiet|--verbose] <path-to-torrent-file-or-magnet-link>\n")
+		fmt.Fprintf(fs.Output(), "Usage: torrent-client [--quiet|--verbose] [--listen-port <port>] <path-to-torrent-file-or-magnet-link>\n")
 		fs.PrintDefaults()
 	}
 
@@ -44,10 +47,14 @@ func main() {
 		opts.Verbose = true
 		opts.EnableStats = true
 	}
+	opts.ListenPort = uint16(*listenPort)
 	peerID := types.GeneratePeerID()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	var torrentFile *types.TorrentFile
 	var peers []types.Peer
+	var trackerURLs []string
 
 	if strings.HasPrefix(input, "magnet:") {
 		// ── Magnet link ───────────────────────────────────────────────────────
@@ -61,8 +68,15 @@ func main() {
 
 		// Minimal struct used only for tracker HTTP announces (needs InfoHash).
 		torrentFile = &types.TorrentFile{InfoHash: magnet.InfoHash}
+		trackerURLs = magnet.Trackers
 
-		peers = gatherPeers(magnet.InfoHash, magnet.Trackers, torrentFile, peerID)
+		go func() {
+			if err := peerpkg.StartInboundListener(ctx, magnet.InfoHash, peerID, opts.ListenPort, opts.Verbose); err != nil && opts.Verbose {
+				fmt.Printf("Inbound listener error: %v\n", err)
+			}
+		}()
+
+		peers = gatherPeers(magnet.InfoHash, trackerURLs, torrentFile, peerID, opts.ListenPort, "started")
 		if len(magnet.PeerAddrs) > 0 {
 			for _, raw := range magnet.PeerAddrs {
 				if p, ok := parsePeerAddr(raw); ok {
@@ -111,7 +125,13 @@ func main() {
 			torrentFile.Info.Length)
 
 		trackers := buildTrackerList(torrentFile)
-		peers = gatherPeers(torrentFile.InfoHash, trackers, torrentFile, peerID)
+		trackerURLs = trackers
+		go func() {
+			if err := peerpkg.StartInboundListener(ctx, torrentFile.InfoHash, peerID, opts.ListenPort, opts.Verbose); err != nil && opts.Verbose {
+				fmt.Printf("Inbound listener error: %v\n", err)
+			}
+		}()
+		peers = gatherPeers(torrentFile.InfoHash, trackers, torrentFile, peerID, opts.ListenPort, "started")
 		if len(peers) < 5 && !torrentFile.Info.Private {
 			fmt.Printf("Only %d tracker peer(s) — also querying DHT...\n", len(peers))
 			dhtPeers, _ := dht.GetPeers(torrentFile.InfoHash, 50, 30*time.Second)
@@ -127,10 +147,12 @@ func main() {
 	}
 
 	fmt.Printf("Starting download from %d peers...\n", len(peers))
+	defer announceLifecycleEvent(trackerURLs, torrentFile, peerID, opts.ListenPort, "stopped", 0)
 	if err := downloader.DownloadTorrentWithOptions(torrentFile, peers, peerID, opts); err != nil {
 		fmt.Println("Download failed:", err)
 		os.Exit(1)
 	}
+	announceLifecycleEvent(trackerURLs, torrentFile, peerID, opts.ListenPort, "completed", 0)
 }
 
 // buildTrackerList returns a deduplicated, flat list of all tracker URLs from a
@@ -158,20 +180,27 @@ func buildTrackerList(tf *types.TorrentFile) []string {
 
 // gatherPeers contacts every tracker URL in order, collecting peers from each
 // and stopping early once 50 or more distinct peers have been found.
-func gatherPeers(infoHash [20]byte, trackers []string, tf *types.TorrentFile, peerID [20]byte) []types.Peer {
+func gatherPeers(infoHash [20]byte, trackers []string, tf *types.TorrentFile, peerID [20]byte, port uint16, event string) []types.Peer {
 	var peers []types.Peer
 	for _, tr := range trackers {
 		var (
 			newPeers []types.Peer
 			err      error
 		)
+		req := tracker.AnnounceRequest{
+			InfoHash: infoHash,
+			PeerID:   peerID,
+			Port:     port,
+			Left:     tf.Info.Length,
+			Event:    event,
+		}
 		switch {
 		case strings.HasPrefix(tr, "udp://"):
-			newPeers, err = tracker.AnnounceUDP(tr, infoHash, peerID, 6881)
+			newPeers, err = tracker.AnnounceUDPWithRequest(tr, req)
 		case strings.HasPrefix(tr, "http://"), strings.HasPrefix(tr, "https://"):
 			tfCopy := *tf
 			tfCopy.Announce = tr
-			newPeers, err = tracker.AnnounceToHTTPTracker(&tfCopy, peerID)
+			newPeers, err = tracker.AnnounceToHTTPTrackerWithRequest(&tfCopy, req)
 		default:
 			continue // ws://, wss://, etc. not supported
 		}
@@ -200,3 +229,25 @@ func parsePeerAddr(raw string) (types.Peer, bool) {
 	return types.Peer{IP: addr.IP, Port: uint16(addr.Port)}, true
 }
 
+func announceLifecycleEvent(trackers []string, tf *types.TorrentFile, peerID [20]byte, port uint16, event string, left int64) {
+	if tf == nil || len(trackers) == 0 {
+		return
+	}
+	req := tracker.AnnounceRequest{
+		InfoHash: tf.InfoHash,
+		PeerID:   peerID,
+		Port:     port,
+		Left:     left,
+		Event:    event,
+	}
+	for _, tr := range trackers {
+		switch {
+		case strings.HasPrefix(tr, "udp://"):
+			_, _ = tracker.AnnounceUDPWithRequest(tr, req)
+		case strings.HasPrefix(tr, "http://"), strings.HasPrefix(tr, "https://"):
+			tfCopy := *tf
+			tfCopy.Announce = tr
+			_, _ = tracker.AnnounceToHTTPTrackerWithRequest(&tfCopy, req)
+		}
+	}
+}
