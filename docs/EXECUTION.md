@@ -125,7 +125,7 @@ For each Piece:
         ↓
 [downloader.go] Assemble File
         ↓
-Save to $HOME/[filename]
+Save to $HOME/Downloads/[filename]
         ↓
 Download Complete
 ```
@@ -158,7 +158,7 @@ All pieces downloaded, assembling file...
 Wrote piece 0 (262144 bytes)
 Wrote piece 1 (262144 bytes)
 ...
-File assembled successfully at: /home/user/big_buck_bunny.mp4
+File assembled successfully at: /home/user/Downloads/big_buck_bunny.mp4
 ```
 
 ---
@@ -179,7 +179,7 @@ Found 42 peers, starting download...
 Downloading 8777 pieces from 42 peers
 Downloaded piece 0 from 192.168.1.50
 ...
-File assembled successfully at: /home/user/Big+Buck+Bunny.mp4
+File assembled successfully at: /home/user/Downloads/Big+Buck+Bunny.mp4
 ```
 
 ---

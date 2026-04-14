@@ -74,7 +74,7 @@ You should see the usage message if the build was successful.
 5. Downloads file pieces concurrently (4 simultaneous connections)
 6. Validates each piece using SHA-1 hash
 7. Assembles all pieces into the final file
-8. Saves the file to `$HOME/[filename]` or `$HOME/downloaded_[hash]`
+8. Saves the file to `$HOME/Downloads/[filename]` or `$HOME/Downloads/downloaded_[hash]`
 
 ### Method 2: Download from a Magnet Link
 
@@ -130,15 +130,15 @@ go build -o bin/torrent-client ./cmd/torrent-client/
 ## Output
 
 The downloaded file will be saved to:
-- **For single-file torrents:** `$HOME/[original-filename]`
-- **For multi-file torrents:** `$HOME/[first-file-name]`
-- **Fallback:** `$HOME/downloaded_[HASH]` if name unavailable
+- **For single-file torrents:** `$HOME/Downloads/[original-filename]`
+- **For multi-file torrents:** `$HOME/Downloads/[first-file-name]`
+- **Fallback:** `$HOME/Downloads/downloaded_[HASH]` if name unavailable
 
 **Example outputs:**
 ```
-/home/user/Downloaded_Movie.mp4
-/home/user/document.pdf
-/home/user/downloaded_8f7c6b155960
+/home/user/Downloads/Downloaded_Movie.mp4
+/home/user/Downloads/document.pdf
+/home/user/Downloads/downloaded_8f7c6b155960
 ```
 
 ## Project Structure

@@ -40,7 +40,7 @@ go build -o bin/torrent-client ./cmd/torrent-client/
 ./bin/torrent-client "magnet:?xt=urn:btih:..."
 ```
 
-**Done!** Your file downloads to `$HOME/`
+**Done!** Your file downloads to `$HOME/Downloads/`
 
 ---
 
@@ -118,7 +118,7 @@ Step 8: For each piece (parallel):
 Step 9: When all pieces downloaded and validated:
         Assemble file/files in final location
          ↓
-Step 10: Save to $HOME/[filename]
+Step 10: Save to $HOME/Downloads/[filename]
          Download complete!
 ```
 
@@ -132,7 +132,7 @@ This process is IDENTICAL for any torrent.
 ```bash
 ./bin/torrent-client movie.torrent
 ↓
-File: /home/user/movie.mp4 (3.7 GB)
+File: /home/user/Downloads/movie.mp4 (3.7 GB)
 Time: ~30-60 minutes (depends on peer availability)
 ```
 
@@ -140,7 +140,7 @@ Time: ~30-60 minutes (depends on peer availability)
 ```bash
 ./bin/torrent-client ubuntu-22.04.torrent  
 ↓
-File: /home/user/ubuntu-22.04-desktop-amd64.iso (4.2 GB)
+File: /home/user/Downloads/ubuntu-22.04-desktop-amd64.iso (4.2 GB)
 Time: ~20-40 minutes
 ```
 
@@ -148,7 +148,7 @@ Time: ~20-40 minutes
 ```bash
 ./bin/torrent-client my-project.tar.gz.torrent
 ↓
-File: /home/user/my-project.tar.gz (250 MB)
+File: /home/user/Downloads/my-project.tar.gz (250 MB)
 Extract with: tar -xzf my-project.tar.gz
 ```
 
@@ -156,7 +156,7 @@ Extract with: tar -xzf my-project.tar.gz
 ```bash
 ./bin/torrent-client "magnet:?xt=urn:btih:ABC123...&tr=..."
 ↓
-File: /home/user/[filename] (ANY size)
+File: /home/user/Downloads/[filename] (ANY size)
 Works exactly like .torrent method
 ```
 

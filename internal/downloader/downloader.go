@@ -193,10 +193,17 @@ func downloadPieceFromPeer(peer *types.Peer, torrent *types.TorrentFile, pieceId
 func AssembleFile(pieces [][]byte, torrent *types.TorrentFile) error {
 	fmt.Println("Creating the downloadable file")
 
-	// Create output filename
+	// Save downloads to the user's Downloads folder when available.
 	outputDir := os.Getenv("HOME")
 	if outputDir == "" {
 		outputDir = "."
+	} else {
+		outputDir = fmt.Sprintf("%s/Downloads", outputDir)
+	}
+
+	// Ensure the output directory exists.
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create output directory: %v", err)
 	}
 
 	var outputFileName string
