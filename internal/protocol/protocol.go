@@ -37,13 +37,31 @@ func Handshake(conn net.Conn, infoHash [20]byte, peerID [20]byte) ([20]byte, err
 	return ReadHandshake(conn, infoHash)
 }
 
+// HandshakeExtended performs a handshake with BEP10 extension bit enabled.
+// It returns the remote peer ID and whether the peer also advertises BEP10 support.
+func HandshakeExtended(conn net.Conn, infoHash [20]byte, peerID [20]byte) ([20]byte, bool, error) {
+	if err := WriteHandshakeWithReserved(conn, infoHash, peerID, [8]byte{0, 0, 0, 0, 0, 0x10, 0, 0}); err != nil {
+		return [20]byte{}, false, err
+	}
+	remotePeerID, reserved, err := ReadHandshakeFull(conn, infoHash)
+	if err != nil {
+		return [20]byte{}, false, err
+	}
+	return remotePeerID, reserved[5]&0x10 != 0, nil
+}
+
 // BuildHandshake builds the canonical 68-byte BitTorrent handshake payload.
 func BuildHandshake(infoHash [20]byte, peerID [20]byte) []byte {
+	return BuildHandshakeWithReserved(infoHash, peerID, [8]byte{})
+}
+
+// BuildHandshakeWithReserved builds handshake bytes with caller-provided reserved bits.
+func BuildHandshakeWithReserved(infoHash [20]byte, peerID [20]byte, reserved [8]byte) []byte {
 	// Protocol: <pstrlen><pstr><reserved><info_hash><peer_id>
 	handshakeMsg := new(bytes.Buffer)
 	handshakeMsg.WriteByte(byte(len(handshakePStr)))
 	handshakeMsg.WriteString(handshakePStr)
-	handshakeMsg.Write(make([]byte, 8))
+	handshakeMsg.Write(reserved[:])
 	handshakeMsg.Write(infoHash[:])
 	handshakeMsg.Write(peerID[:])
 	return handshakeMsg.Bytes()
@@ -51,8 +69,13 @@ func BuildHandshake(infoHash [20]byte, peerID [20]byte) []byte {
 
 // WriteHandshake writes a BitTorrent handshake to conn.
 func WriteHandshake(conn net.Conn, infoHash [20]byte, peerID [20]byte) error {
+	return WriteHandshakeWithReserved(conn, infoHash, peerID, [8]byte{})
+}
+
+// WriteHandshakeWithReserved writes handshake bytes with caller-provided reserved bits.
+func WriteHandshakeWithReserved(conn net.Conn, infoHash [20]byte, peerID [20]byte, reserved [8]byte) error {
 	conn.SetWriteDeadline(time.Now().Add(connTimeout))
-	if _, err := conn.Write(BuildHandshake(infoHash, peerID)); err != nil {
+	if _, err := conn.Write(BuildHandshakeWithReserved(infoHash, peerID, reserved)); err != nil {
 		return fmt.Errorf("failed to send handshake: %v", err)
 	}
 	return nil
@@ -61,27 +84,36 @@ func WriteHandshake(conn net.Conn, infoHash [20]byte, peerID [20]byte) error {
 // ReadHandshake reads and validates a BitTorrent handshake from conn.
 // If expectedInfoHash is non-zero, the incoming info-hash must match.
 func ReadHandshake(conn net.Conn, expectedInfoHash [20]byte) ([20]byte, error) {
+	remoteID, _, err := ReadHandshakeFull(conn, expectedInfoHash)
+	return remoteID, err
+}
+
+// ReadHandshakeFull reads handshake and returns peer ID plus reserved bytes.
+func ReadHandshakeFull(conn net.Conn, expectedInfoHash [20]byte) ([20]byte, [8]byte, error) {
 	conn.SetReadDeadline(time.Now().Add(readTimeout))
 	response := make([]byte, handshakeLen)
 	if _, err := io.ReadFull(conn, response); err != nil {
-		return [20]byte{}, fmt.Errorf("failed to receive handshake: %v", err)
+		return [20]byte{}, [8]byte{}, fmt.Errorf("failed to receive handshake: %v", err)
 	}
 
 	if response[0] != byte(len(handshakePStr)) || string(response[1:20]) != handshakePStr {
-		return [20]byte{}, fmt.Errorf("invalid protocol name in handshake")
+		return [20]byte{}, [8]byte{}, fmt.Errorf("invalid protocol name in handshake")
 	}
 
 	if expectedInfoHash != ([20]byte{}) {
 		var recvInfoHash [20]byte
 		copy(recvInfoHash[:], response[28:48])
 		if recvInfoHash != expectedInfoHash {
-			return [20]byte{}, fmt.Errorf("unexpected info hash in handshake")
+			return [20]byte{}, [8]byte{}, fmt.Errorf("unexpected info hash in handshake")
 		}
 	}
 
+	var reserved [8]byte
+	copy(reserved[:], response[20:28])
+
 	var remotePeerID [20]byte
 	copy(remotePeerID[:], response[48:68])
-	return remotePeerID, nil
+	return remotePeerID, reserved, nil
 }
 
 // SendMessage sends a message to the peer.

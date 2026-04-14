@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	bencode "github.com/jackpal/bencode-go"
 	"torrent-client/internal/dht"
 	"torrent-client/internal/protocol"
 	"torrent-client/internal/tracker"
@@ -76,6 +77,7 @@ type peerSession struct {
 	bitfield  []byte
 	unchoked  bool
 	servedCnt int
+	utPexID   int
 }
 
 type peerStat struct {
@@ -343,7 +345,7 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 							if err != nil {
 								return
 							}
-							newSession, err := newPeerSession(peer, torrent, peerID)
+							newSession, err := newPeerSession(peer, torrent, peerID, pool.Add)
 							if err != nil {
 								pool.ReportFailure(peer)
 								pool.Release(peer)
@@ -353,7 +355,7 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 						}
 
 						started := time.Now()
-						pieceData, err := downloadPieceFromSession(sess, torrent, pieceIdx)
+						pieceData, err := downloadPieceFromSession(sess, torrent, pieceIdx, pool.Add)
 						if err != nil {
 							if err == errPeerMissingPiece {
 								pool.ReportFailure(sess.peer)
@@ -704,13 +706,14 @@ func (p *peerPool) Snapshot() poolSnapshot {
 	return snap
 }
 
-func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte) (*peerSession, error) {
+func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte, onPeerDiscovered func(types.Peer)) (*peerSession, error) {
 	conn, err := ConnectToPeer(peer)
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err := protocol.Handshake(conn, torrent.InfoHash, peerID); err != nil {
+	_, supportsExt, err := protocol.HandshakeExtended(conn, torrent.InfoHash, peerID)
+	if err != nil {
 		conn.Close() //nolint:errcheck
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
@@ -721,7 +724,18 @@ func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte
 	}
 
 	sess := &peerSession{peer: peer, conn: conn}
-	for i := 0; i < 32; i++ {
+	if supportsExt {
+		type extHandshake struct {
+			M map[string]int64 `bencode:"m"`
+		}
+		ourHS := extHandshake{M: map[string]int64{"ut_pex": 1}}
+		var b strings.Builder
+		if err := bencode.Marshal(&b, ourHS); err == nil {
+			_ = protocol.SendMessage(conn, protocol.Message{ID: protocol.MsgExtended, Payload: append([]byte{0}, []byte(b.String())...)})
+		}
+	}
+
+	for i := 0; i < 40; i++ {
 		msg, err := protocol.ReadMessage(conn)
 		if err != nil {
 			conn.Close() //nolint:errcheck
@@ -734,6 +748,25 @@ func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte
 			if len(msg.Payload) >= 4 {
 				idx := parseHaveIndex(msg.Payload)
 				setBitfieldPiece(&sess.bitfield, idx)
+			}
+		case protocol.MsgExtended:
+			if len(msg.Payload) < 2 {
+				continue
+			}
+			if msg.Payload[0] == 0 {
+				type extHandshake struct {
+					M map[string]int64 `bencode:"m"`
+				}
+				var hs extHandshake
+				if err := bencode.Unmarshal(strings.NewReader(string(msg.Payload[1:])), &hs); err == nil {
+					if v, ok := hs.M["ut_pex"]; ok && v > 0 && v < 256 {
+						sess.utPexID = int(v)
+					}
+				}
+			} else if sess.utPexID > 0 && int(msg.Payload[0]) == sess.utPexID {
+				for _, p := range parseUtPexPeers(msg.Payload[1:]) {
+					onPeerDiscovered(p)
+				}
 			}
 		case protocol.MsgUnchoke:
 			sess.unchoked = true
@@ -751,7 +784,7 @@ func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte
 	return sess, nil
 }
 
-func downloadPieceFromSession(sess *peerSession, torrent *types.TorrentFile, pieceIdx int) ([]byte, error) {
+func downloadPieceFromSession(sess *peerSession, torrent *types.TorrentFile, pieceIdx int, onPeerDiscovered func(types.Peer)) ([]byte, error) {
 	if len(sess.bitfield) > 0 && !bitfieldHasPiece(sess.bitfield, pieceIdx) {
 		return nil, errPeerMissingPiece
 	}
@@ -808,6 +841,15 @@ func downloadPieceFromSession(sess *peerSession, torrent *types.TorrentFile, pie
 			sess.bitfield = append([]byte(nil), msg.Payload...)
 			if !bitfieldHasPiece(sess.bitfield, pieceIdx) {
 				return nil, errPeerMissingPiece
+			}
+		case protocol.MsgExtended:
+			if len(msg.Payload) < 2 {
+				continue
+			}
+			if sess.utPexID > 0 && int(msg.Payload[0]) == sess.utPexID {
+				for _, p := range parseUtPexPeers(msg.Payload[1:]) {
+					onPeerDiscovered(p)
+				}
 			}
 		case protocol.MsgChoke:
 			return nil, fmt.Errorf("peer choked during piece transfer")
@@ -1265,6 +1307,30 @@ func setBitfieldPiece(bitfield *[]byte, pieceIdx int) {
 	}
 	bit := uint(7 - (pieceIdx % 8))
 	(*bitfield)[byteIdx] |= (1 << bit)
+}
+
+func parseUtPexPeers(payload []byte) []types.Peer {
+	type utPexMessage struct {
+		Added string `bencode:"added"`
+	}
+	var msg utPexMessage
+	if err := bencode.Unmarshal(strings.NewReader(string(payload)), &msg); err != nil {
+		return nil
+	}
+	data := []byte(msg.Added)
+	if len(data) < 6 {
+		return nil
+	}
+	peers := make([]types.Peer, 0, len(data)/6)
+	for i := 0; i+6 <= len(data); i += 6 {
+		ip := net.IPv4(data[i], data[i+1], data[i+2], data[i+3])
+		port := uint16(data[i+4])<<8 | uint16(data[i+5])
+		if port == 0 {
+			continue
+		}
+		peers = append(peers, types.Peer{IP: ip, Port: port})
+	}
+	return peers
 }
 
 func discoveryLoop(ctx context.Context, torrent *types.TorrentFile, trackers []string, peerID [20]byte, listenPort uint16, addPeer func(types.Peer)) {

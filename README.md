@@ -34,6 +34,7 @@ A fully functional, production-ready BitTorrent client written in Go — support
 | Basic upload serving | ✅ | Serves available pieces to inbound peers via request/piece messages |
 | Tracker progress counters | ✅ | Announces live `downloaded`, `left`, and `uploaded` values |
 | Discovery retries/fallbacks | ✅ | Multi-round tracker announces + DHT rounds + peer dedupe |
+| Peer exchange (PEX ingest) | ✅ | Accepts ut_pex peers from BEP10-capable sessions |
 | Rarest-first + endgame mode | ✅ | Better swarm efficiency and tail completion |
 | Concurrent downloading | ✅ | Configured worker pool with long-lived peer sessions |
 | Runtime telemetry | ✅ | Piece/peer stats during download, toggleable |
