@@ -16,13 +16,14 @@ A fully functional, production-ready BitTorrent client written in Go — support
 | Feature | Status | Details |
 |---|---|---|
 | `.torrent` file parsing | ✅ | Full bencode decoding, multi-file torrents |
-| Magnet link support | ✅ | Hex & base32 info hash, multiple `tr=` params |
+| Magnet link support | ✅ | Hex/base32 info hash, multiple `tr=` trackers, `x.pe` peer hints |
 | HTTP tracker (BEP 3) | ✅ | Compact & dictionary peer formats |
 | UDP tracker (BEP 15) | ✅ | Full connect → announce handshake |
 | DHT peer discovery (BEP 5) | ✅ | Kademlia iterative lookup, public bootstrap nodes |
 | Extension protocol (BEP 10) | ✅ | Capability handshake with peers |
 | Metadata from peers (BEP 9) | ✅ | `ut_metadata` — download info-dict from swarm |
 | BitTorrent wire protocol | ✅ | Handshake, choke/unchoke, request, piece, cancel |
+| Private torrent safety | ✅ | Honors `private=1` and skips DHT where required |
 | Piece integrity (SHA-1) | ✅ | Every piece verified before writing |
 | Resumable downloads | ✅ | Persisted piece state + on-disk piece verification |
 | Disk-backed piece writes | ✅ | No full-file in-memory buffering |
@@ -84,7 +85,7 @@ Optional runtime flags:
 
 1. Parse torrent file (bencode) — extracts info hash, piece hashes, trackers, file list
 2. Load existing resume state (if present) and verify completed pieces from disk
-3. Contact HTTP/UDP trackers and DHT to seed the peer pool
+3. Contact HTTP/UDP trackers (plus DHT only when torrent is not private) to seed the peer pool
 4. Start adaptive workers with long-lived peer sessions and pipelined block requests
 5. Continue peer discovery in the background while downloading
 6. SHA-1 verify every piece, write directly to output offsets, and persist state
@@ -109,13 +110,18 @@ Optional runtime flags:
 
 # Bare magnet (no trackers — uses DHT automatically)
 ./bin/torrent-client "magnet:?xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD"
+
+# Magnet with peer hints (x.pe)
+./bin/torrent-client "magnet:?xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD&x.pe=203.0.113.10:51413"
 ```
 
 **What happens (extra steps vs .torrent):**
 
 - If trackers are listed: contacts all of them (HTTP + UDP)
+- If `x.pe` peer hints are present: seeds those peers immediately
 - If no trackers, or fewer than 5 peers found: runs a DHT (BEP 5) Kademlia lookup against public bootstrap nodes to find peers
 - Once peers are found: fetches the full torrent metadata from the swarm using BEP 9 (`ut_metadata`) and verifies it against the info hash
+- If fetched metadata marks the torrent as private (`private=1`): DHT is disabled for the download phase
 - Then proceeds identically to a .torrent file download
 
 ---
@@ -127,7 +133,7 @@ Files are saved to:
 | Scenario | Output path |
 |---|---|
 | Single-file torrent with name | `$HOME/Downloads/<filename>` |
-| Multi-file torrent | `$HOME/Downloads/<first-file-name>` |
+| Multi-file torrent | `$HOME/Downloads/<torrent-name>/...` (full file tree restored) |
 | Name unavailable | `$HOME/Downloads/downloaded_<8-byte-hash>` |
 
 ---
@@ -146,6 +152,7 @@ User input (.torrent file or magnet link)
                     │  1. HTTP trackers  (BEP 3)                  │
                     │  2. UDP trackers   (BEP 15)                 │
                     │  3. DHT bootstrap  (BEP 5) — fallback       │
+                    │     (disabled for private torrents)         │
                     └───────────────────────┬────────────────────┘
                                             │
                     ┌───────────────────────▼────────────────────┐
