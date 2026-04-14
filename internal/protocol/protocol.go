@@ -266,3 +266,20 @@ func BitfieldMessage(bitfield []byte) Message {
 		Payload: bitfield,
 	}
 }
+
+// HaveMessage builds a have message announcing a completed piece.
+func HaveMessage(pieceIndex uint32) Message {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, pieceIndex)
+	return Message{ID: MsgHave, Payload: payload}
+}
+
+// CancelMessage cancels a pending block request.
+// Used in endgame mode when another peer already delivered the block.
+func CancelMessage(index, begin, length uint32) Message {
+	payload := make([]byte, 12)
+	binary.BigEndian.PutUint32(payload[0:4], index)
+	binary.BigEndian.PutUint32(payload[4:8], begin)
+	binary.BigEndian.PutUint32(payload[8:12], length)
+	return Message{ID: MsgCancel, Payload: payload}
+}

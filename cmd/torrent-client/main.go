@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"torrent-client/internal/choke"
 	"torrent-client/internal/dht"
 	"torrent-client/internal/downloader"
 	peerpkg "torrent-client/internal/peer"
@@ -67,8 +69,22 @@ func main() {
 	var downloadedBytes atomic.Int64
 	var uploadedBytes atomic.Int64
 	var leftBytes atomic.Int64
+	unchoker := choke.NewUnchokeRound(4)
 	var externalIP string
 	var mapper *portmap.Mapper
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _ = unchoker.DecideUnchokes()
+			}
+		}
+	}()
 
 	// Try to map port with UPnP/NAT-PMP for better reachability
 	if *enableNAT {
@@ -158,8 +174,16 @@ func main() {
 			err := peerpkg.StartInboundListener(ctx, magnet.InfoHash, peerID, opts.ListenPort, peerpkg.ListenerOptions{
 				Verbose:  opts.Verbose,
 				Provider: provider,
-				OnUploaded: func(bytes int) {
+				OnPeerSeen: func(p types.Peer) {
+					unchoker.RegisterPeer(p)
+				},
+				ShouldUnchoke: func(p types.Peer) bool {
+					st := unchoker.GetPeerStats(p)
+					return st != nil && !st.Choked
+				},
+				OnUploaded: func(p types.Peer, bytes int) {
 					uploadedBytes.Add(int64(bytes))
+					unchoker.RecordUpload(p, int64(bytes))
 				},
 			})
 			if err != nil && opts.Verbose {
@@ -191,8 +215,16 @@ func main() {
 			err := peerpkg.StartInboundListener(ctx, torrentFile.InfoHash, peerID, opts.ListenPort, peerpkg.ListenerOptions{
 				Verbose:  opts.Verbose,
 				Provider: provider,
-				OnUploaded: func(bytes int) {
+				OnPeerSeen: func(p types.Peer) {
+					unchoker.RegisterPeer(p)
+				},
+				ShouldUnchoke: func(p types.Peer) bool {
+					st := unchoker.GetPeerStats(p)
+					return st != nil && !st.Choked
+				},
+				OnUploaded: func(p types.Peer, bytes int) {
 					uploadedBytes.Add(int64(bytes))
+					unchoker.RecordUpload(p, int64(bytes))
 				},
 			})
 			if err != nil && opts.Verbose {
@@ -245,18 +277,33 @@ func main() {
 	}
 
 	fmt.Printf("Starting download from %d peers...\n", len(peers))
-	defer announceLifecycleEventWithStats(
-		trackerURLs,
-		torrentFile,
-		peerID,
-		opts.ListenPort,
-		"stopped",
-		downloadedBytes.Load(),
-		uploadedBytes.Load(),
-		leftBytes.Load(),
-	)
-	if err := downloader.DownloadTorrentWithOptions(torrentFile, peers, peerID, opts); err != nil {
-		fmt.Println("Download failed:", err)
+	// Use a closure so atomic loads happen at defer execution time, not registration time.
+	defer func() {
+		announceLifecycleEventWithStats(
+			trackerURLs,
+			torrentFile,
+			peerID,
+			opts.ListenPort,
+			"stopped",
+			downloadedBytes.Load(),
+			uploadedBytes.Load(),
+			leftBytes.Load(),
+		)
+	}()
+	dlErr := downloader.DownloadTorrentWithOptions(torrentFile, peers, peerID, opts)
+	if dlErr != nil {
+		var de *downloader.DownloadError
+		if errors.As(dlErr, &de) {
+			fmt.Printf("\nDownload failed [%s]: %s\n", de.Reason, de.Details)
+			if de.Hint != "" {
+				fmt.Printf("Suggestion: %s\n", de.Hint)
+			}
+			if de.Cause != nil {
+				fmt.Printf("Cause: %v\n", de.Cause)
+			}
+		} else {
+			fmt.Println("Download failed:", dlErr)
+		}
 		os.Exit(1)
 	}
 	announceLifecycleEventWithStats(

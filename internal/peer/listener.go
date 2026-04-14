@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"torrent-client/internal/protocol"
+	"torrent-client/internal/types"
 )
 
 // PieceProvider provides local piece availability for inbound upload serving.
@@ -18,9 +19,11 @@ type PieceProvider interface {
 
 // ListenerOptions controls inbound listener behavior.
 type ListenerOptions struct {
-	Verbose    bool
-	Provider   PieceProvider
-	OnUploaded func(bytes int)
+	Verbose       bool
+	Provider      PieceProvider
+	OnUploaded    func(peer types.Peer, bytes int)
+	OnPeerSeen    func(peer types.Peer)
+	ShouldUnchoke func(peer types.Peer) bool
 }
 
 func buildBitfield(provider PieceProvider) []byte {
@@ -73,6 +76,11 @@ func StartInboundListener(ctx context.Context, infoHash [20]byte, peerID [20]byt
 		go func(c net.Conn) {
 			defer c.Close()
 
+			remotePeer, ok := peerFromRemoteAddr(c.RemoteAddr())
+			if ok && opts.OnPeerSeen != nil {
+				opts.OnPeerSeen(remotePeer)
+			}
+
 			if _, err := protocol.ReadHandshake(c, infoHash); err != nil {
 				return
 			}
@@ -82,18 +90,56 @@ func StartInboundListener(ctx context.Context, infoHash [20]byte, peerID [20]byt
 
 			_ = protocol.SendMessage(c, protocol.BitfieldMessage(bitfield))
 			_ = protocol.SendMessage(c, protocol.Message{ID: protocol.MsgChoke})
+			peerChoked := true
 
 			_ = c.SetDeadline(time.Now().Add(90 * time.Second))
 			for {
+				if ok && opts.ShouldUnchoke != nil {
+					wantUnchoked := opts.ShouldUnchoke(remotePeer)
+					if wantUnchoked && peerChoked {
+						if err := protocol.SendMessage(c, protocol.Message{ID: protocol.MsgUnchoke}); err != nil {
+							return
+						}
+						peerChoked = false
+					} else if !wantUnchoked && !peerChoked {
+						if err := protocol.SendMessage(c, protocol.Message{ID: protocol.MsgChoke}); err != nil {
+							return
+						}
+						peerChoked = true
+					}
+				}
+
 				msg, err := protocol.ReadMessage(c)
 				if err != nil {
 					return
 				}
 				switch msg.ID {
 				case protocol.MsgInterested:
-					_ = protocol.SendMessage(c, protocol.Message{ID: protocol.MsgUnchoke})
+					if ok && opts.ShouldUnchoke != nil {
+						if opts.ShouldUnchoke(remotePeer) {
+							if peerChoked {
+								if err := protocol.SendMessage(c, protocol.Message{ID: protocol.MsgUnchoke}); err != nil {
+									return
+								}
+								peerChoked = false
+							}
+						} else if !peerChoked {
+							if err := protocol.SendMessage(c, protocol.Message{ID: protocol.MsgChoke}); err != nil {
+								return
+							}
+							peerChoked = true
+						}
+					} else {
+						if err := protocol.SendMessage(c, protocol.Message{ID: protocol.MsgUnchoke}); err != nil {
+							return
+						}
+						peerChoked = false
+					}
 				case protocol.MsgRequest:
 					if opts.Provider == nil {
+						continue
+					}
+					if peerChoked {
 						continue
 					}
 					idx, begin, length, err := protocol.ParseRequestMessage(msg.Payload)
@@ -108,10 +154,20 @@ func StartInboundListener(ctx context.Context, infoHash [20]byte, peerID [20]byt
 						return
 					}
 					if opts.OnUploaded != nil {
-						opts.OnUploaded(len(block))
+						if ok {
+							opts.OnUploaded(remotePeer, len(block))
+						}
 					}
 				}
 			}
 		}(conn)
 	}
+}
+
+func peerFromRemoteAddr(addr net.Addr) (types.Peer, bool) {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok || tcpAddr == nil || tcpAddr.IP == nil || tcpAddr.Port <= 0 || tcpAddr.Port > 65535 {
+		return types.Peer{}, false
+	}
+	return types.Peer{IP: tcpAddr.IP, Port: uint16(tcpAddr.Port)}, true
 }
