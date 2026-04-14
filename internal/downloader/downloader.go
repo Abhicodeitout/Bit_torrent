@@ -1,4 +1,4 @@
-package main
+package downloader
 
 import (
 	"crypto/sha1"
@@ -7,15 +7,34 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"torrent-client/internal/protocol"
+	"torrent-client/internal/types"
 )
 
 const (
 	blockSize    = 16 * 1024 // 16 KB
 	numGoroutine = 4
+	connTimeout  = 10 * time.Second
 )
 
+// ConnectToPeer establishes a connection to the specified peer.
+func ConnectToPeer(peer types.Peer) (net.Conn, error) {
+	address := fmt.Sprintf("%s:%d", peer.IP.String(), peer.Port)
+	fmt.Printf("Attempting to connect to peer: %s\n", address)
+
+	conn, err := net.DialTimeout("tcp", address, connTimeout)
+	if err != nil {
+		fmt.Printf("Failed to connect to peer %s: %v\n", address, err)
+		return nil, err
+	}
+
+	fmt.Printf("Connected to peer: %s\n", address)
+	return conn, nil
+}
+
 // DownloadTorrent downloads pieces from the specified peers.
-func DownloadTorrent(torrent *TorrentFile, peers []Peer, peerID [20]byte) error {
+func DownloadTorrent(torrent *types.TorrentFile, peers []types.Peer, peerID [20]byte) error {
 	if torrent == nil || len(torrent.Info.PieceHashes) == 0 {
 		return fmt.Errorf("invalid torrent or no pieces to download")
 	}
@@ -78,7 +97,7 @@ func DownloadTorrent(torrent *TorrentFile, peers []Peer, peerID [20]byte) error 
 }
 
 // downloadPieceFromPeer downloads a specific piece from a peer.
-func downloadPieceFromPeer(peer *Peer, torrent *TorrentFile, pieceIdx int, pieces [][]byte, downloaded *[]bool, mu *sync.Mutex, peerID [20]byte) error {
+func downloadPieceFromPeer(peer *types.Peer, torrent *types.TorrentFile, pieceIdx int, pieces [][]byte, downloaded *[]bool, mu *sync.Mutex, peerID [20]byte) error {
 	conn, err := ConnectToPeer(*peer)
 	if err != nil {
 		return err
@@ -86,26 +105,26 @@ func downloadPieceFromPeer(peer *Peer, torrent *TorrentFile, pieceIdx int, piece
 	defer conn.Close()
 
 	// Perform handshake
-	_, err = Handshake(conn, torrent.InfoHash, peerID)
+	_, err = protocol.Handshake(conn, torrent.InfoHash, peerID)
 	if err != nil {
 		return fmt.Errorf("handshake failed: %v", err)
 	}
 
 	// Send interested message
-	if err := SendMessage(conn, InterestedMessage()); err != nil {
+	if err := protocol.SendMessage(conn, protocol.InterestedMessage()); err != nil {
 		return fmt.Errorf("failed to send interested: %v", err)
 	}
 
 	// Wait for unchoke
 	for {
-		msg, err := ReadMessage(conn)
+		msg, err := protocol.ReadMessage(conn)
 		if err != nil {
 			return fmt.Errorf("error reading message: %v", err)
 		}
 
-		if msg.ID == MsgUnchoke {
+		if msg.ID == protocol.MsgUnchoke {
 			break
-		} else if msg.ID == MsgChoke {
+		} else if msg.ID == protocol.MsgChoke {
 			return fmt.Errorf("peer choked us")
 		}
 	}
@@ -129,20 +148,20 @@ func downloadPieceFromPeer(peer *Peer, torrent *TorrentFile, pieceIdx int, piece
 		}
 
 		// Request block
-		reqMsg := RequestMessage(uint32(pieceIdx), uint32(begin), uint32(blockLen))
-		if err := SendMessage(conn, reqMsg); err != nil {
+		reqMsg := protocol.RequestMessage(uint32(pieceIdx), uint32(begin), uint32(blockLen))
+		if err := protocol.SendMessage(conn, reqMsg); err != nil {
 			return fmt.Errorf("failed to send request: %v", err)
 		}
 
 		// Read piece message
 		for {
-			msg, err := ReadMessage(conn)
+			msg, err := protocol.ReadMessage(conn)
 			if err != nil {
 				return fmt.Errorf("error reading message: %v", err)
 			}
 
-			if msg.ID == MsgPiece {
-				idx, off, block, err := ParsePieceMessage(msg.Payload)
+			if msg.ID == protocol.MsgPiece {
+				idx, off, block, err := protocol.ParsePieceMessage(msg.Payload)
 				if err != nil {
 					return err
 				}
@@ -171,7 +190,7 @@ func downloadPieceFromPeer(peer *Peer, torrent *TorrentFile, pieceIdx int, piece
 }
 
 // AssembleFile assembles downloaded pieces into the final file.
-func AssembleFile(pieces [][]byte, torrent *TorrentFile) error {
+func AssembleFile(pieces [][]byte, torrent *types.TorrentFile) error {
 	fmt.Println("Creating the downloadable file")
 
 	// Create output filename
@@ -215,7 +234,7 @@ func AssembleFile(pieces [][]byte, torrent *TorrentFile) error {
 }
 
 // RequestPiece requests a specific piece from the peer (legacy, kept for compatibility).
-func RequestPiece(peer Peer, index int) ([]byte, error) {
+func RequestPiece(peer types.Peer, index int) ([]byte, error) {
 	address := fmt.Sprintf("%s:%d", peer.IP.String(), peer.Port)
 
 	conn, err := net.DialTimeout("tcp", address, 30*time.Second)

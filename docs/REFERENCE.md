@@ -31,13 +31,13 @@ Your BitTorrent client **WORKS WITH ANY TORRENT** - no limitations, no restricti
 cd /workspaces/Bit_torrent
 
 # Build
-go build -o torrent-client
+go build -o bin/torrent-client ./cmd/torrent-client/
 
 # Download ANY torrent
-./torrent-client path/to/any-torrent-file.torrent
+./bin/torrent-client path/to/any-torrent-file.torrent
 
 # OR with magnet
-./torrent-client "magnet:?xt=urn:btih:..."
+./bin/torrent-client "magnet:?xt=urn:btih:..."
 ```
 
 **Done!** Your file downloads to `$HOME/`
@@ -130,7 +130,7 @@ This process is IDENTICAL for any torrent.
 
 ### Scenario A: Download a Video
 ```bash
-./torrent-client movie.torrent
+./bin/torrent-client movie.torrent
 ↓
 File: /home/user/movie.mp4 (3.7 GB)
 Time: ~30-60 minutes (depends on peer availability)
@@ -138,7 +138,7 @@ Time: ~30-60 minutes (depends on peer availability)
 
 ### Scenario B: Download a Linux ISO
 ```bash
-./torrent-client ubuntu-22.04.torrent  
+./bin/torrent-client ubuntu-22.04.torrent  
 ↓
 File: /home/user/ubuntu-22.04-desktop-amd64.iso (4.2 GB)
 Time: ~20-40 minutes
@@ -146,7 +146,7 @@ Time: ~20-40 minutes
 
 ### Scenario C: Download a Folder/Archive
 ```bash
-./torrent-client my-project.tar.gz.torrent
+./bin/torrent-client my-project.tar.gz.torrent
 ↓
 File: /home/user/my-project.tar.gz (250 MB)
 Extract with: tar -xzf my-project.tar.gz
@@ -154,7 +154,7 @@ Extract with: tar -xzf my-project.tar.gz
 
 ### Scenario D: Download from Magnet
 ```bash
-./torrent-client "magnet:?xt=urn:btih:ABC123...&tr=..."
+./bin/torrent-client "magnet:?xt=urn:btih:ABC123...&tr=..."
 ↓
 File: /home/user/[filename] (ANY size)
 Works exactly like .torrent method
@@ -338,7 +338,7 @@ See [LICENSE](LICENSE) for full details.
 
 1. **Test it:**
    ```bash
-   ./torrent-client big-buck-bunny.torrent  # Provided test file
+   ./bin/torrent-client big-buck-bunny.torrent  # Provided test file
    ```
 
 2. **Try with real torrents:**
@@ -370,7 +370,7 @@ See [LICENSE](LICENSE) for full details.
 **No config needed. No special setup. Just run it with any torrent.**
 
 ```bash
-./torrent-client any-torrent-file.torrent
+./bin/torrent-client any-torrent-file.torrent
 ```
 
 **That's it!** 🎉

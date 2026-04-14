@@ -1,4 +1,4 @@
-package main
+package tracker
 
 import (
 	"bytes"
@@ -11,10 +11,11 @@ import (
 	"time"
 
 	bencode "github.com/jackpal/bencode-go"
+	"torrent-client/internal/types"
 )
 
 // AnnounceUDP sends an announcement to the UDP tracker and retrieves a list of peers.
-func AnnounceUDP(trackerURL string, infoHash [20]byte, peerID [20]byte, port uint16) ([]Peer, error) {
+func AnnounceUDP(trackerURL string, infoHash [20]byte, peerID [20]byte, port uint16) ([]types.Peer, error) {
 	conn, err := net.DialTimeout("udp", trackerURL, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to UDP tracker: %v", err)
@@ -26,11 +27,11 @@ func AnnounceUDP(trackerURL string, infoHash [20]byte, peerID [20]byte, port uin
 	fmt.Printf("Connected to UDP tracker at %s\n", trackerURL)
 
 	// For now, return empty peer list as UDP tracker implementation is complex
-	return []Peer{}, nil
+	return []types.Peer{}, nil
 }
 
-// announceToHTTPTracker sends an HTTP GET request to the HTTP tracker and retrieves a list of peers.
-func announceToHTTPTracker(torrent *TorrentFile, peerID [20]byte) ([]Peer, error) {
+// AnnounceToHTTPTracker sends an HTTP GET request to the HTTP tracker and retrieves a list of peers.
+func AnnounceToHTTPTracker(torrent *types.TorrentFile, peerID [20]byte) ([]types.Peer, error) {
 	baseURL, err := url.Parse(torrent.Announce)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tracker URL: %v", err)
@@ -83,7 +84,7 @@ func announceToHTTPTracker(torrent *TorrentFile, peerID [20]byte) ([]Peer, error
 	}
 
 	// Parse peers
-	var peers []Peer
+	var peers []types.Peer
 
 	// Try compact format first
 	if peersStr, ok := response["peers"].(string); ok {
@@ -95,7 +96,7 @@ func announceToHTTPTracker(torrent *TorrentFile, peerID [20]byte) ([]Peer, error
 				if ipStr, ok := peerMap["ip"].(string); ok {
 					if port, ok := peerMap["port"].(int64); ok {
 						ip := net.ParseIP(ipStr)
-						peers = append(peers, Peer{
+						peers = append(peers, types.Peer{
 							IP:   ip,
 							Port: uint16(port),
 						})
@@ -110,11 +111,11 @@ func announceToHTTPTracker(torrent *TorrentFile, peerID [20]byte) ([]Peer, error
 }
 
 // ParsePeersCompact parses the compact peer list from the tracker response and returns a list of peers.
-func ParsePeersCompact(data []byte) []Peer {
+func ParsePeersCompact(data []byte) []types.Peer {
 	const peerSize = 6 // 4 bytes for IP, 2 bytes for port
 	numPeers := len(data) / peerSize
 
-	var peers []Peer
+	var peers []types.Peer
 	for i := 0; i < numPeers; i++ {
 		offset := i * peerSize
 		if offset+peerSize > len(data) {
@@ -123,7 +124,7 @@ func ParsePeersCompact(data []byte) []Peer {
 
 		ip := net.IPv4(data[offset], data[offset+1], data[offset+2], data[offset+3])
 		port := binary.BigEndian.Uint16(data[offset+4 : offset+6])
-		peers = append(peers, Peer{IP: ip, Port: port})
+		peers = append(peers, types.Peer{IP: ip, Port: port})
 	}
 
 	fmt.Printf("Parsed %d peers from compact format\n", len(peers))
@@ -131,6 +132,6 @@ func ParsePeersCompact(data []byte) []Peer {
 }
 
 // ParsePeers is an alias for ParsePeersCompact for backward compatibility
-func ParsePeers(data []byte) []Peer {
+func ParsePeers(data []byte) []types.Peer {
 	return ParsePeersCompact(data)
 }

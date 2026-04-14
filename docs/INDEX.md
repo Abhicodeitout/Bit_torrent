@@ -111,13 +111,13 @@ bash EXAMPLES.sh
 
 ### "I want to use this RIGHT NOW"
 1. Read: [EXECUTION.md](EXECUTION.md) - Step-by-Step Guide
-2. Run: `./torrent-client big-buck-bunny.torrent`
+2. Run: `./bin/torrent-client big-buck-bunny.torrent`
 3. Download starts! ✅
 
 ### "I want to download a DIFFERENT torrent"
 1. Read: [UNIVERSAL_SUPPORT.md](UNIVERSAL_SUPPORT.md)
 2. Understand: It works with ANY torrent
-3. Run: `./torrent-client your-torrent-file.torrent`
+3. Run: `./bin/torrent-client your-torrent-file.torrent`
 4. Done! ✅
 
 ### "I want EXAMPLES for different scenarios"
@@ -163,16 +163,16 @@ bash EXAMPLES.sh
 ```bash
 # Build
 cd /workspaces/Bit_torrent
-go build -o torrent-client
+go build -o bin/torrent-client ./cmd/torrent-client/
 
 # Test download (provided file)
-./torrent-client big-buck-bunny.torrent
+./bin/torrent-client big-buck-bunny.torrent
 
 # Or with ANY other torrent
-./torrent-client /path/to/any-torrent.torrent
+./bin/torrent-client /path/to/any-torrent.torrent
 
 # Or with magnet link
-./torrent-client "magnet:?xt=urn:btih:..."
+./bin/torrent-client "magnet:?xt=urn:btih:..."
 
 # Show all examples
 bash EXAMPLES.sh
@@ -230,7 +230,7 @@ go build -o torrent-client  # Compile
 
 **Run:**
 ```bash
-./torrent-client <torrent-file-or-magnet>
+./bin/torrent-client <torrent-file-or-magnet>
 ```
 
 ---
@@ -334,7 +334,7 @@ Your BitTorrent client is:
 **Pick a torrent and start downloading:**
 
 ```bash
-./torrent-client /path/to/file.torrent
+./bin/torrent-client /path/to/file.torrent
 ```
 
 ---

@@ -1,0 +1,27 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Test binary
+*.test
+*.out
+
+# Go build cache
+.cache/
+go.sum.tmp
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Downloads
+downloaded_*

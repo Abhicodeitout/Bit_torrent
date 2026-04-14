@@ -4,8 +4,8 @@
 
 ```bash
 cd /workspaces/Bit_torrent
-go build -o torrent-client
-./torrent-client big-buck-bunny.torrent
+go build -o bin/torrent-client ./cmd/torrent-client/
+./bin/torrent-client big-buck-bunny.torrent
 ```
 
 ---
@@ -52,7 +52,7 @@ go mod verify
 
 ```bash
 # Compile the project
-go build -o torrent-client
+go build -o bin/torrent-client ./cmd/torrent-client/
 
 # Verify the binary was created
 file torrent-client
@@ -65,7 +65,7 @@ file torrent-client
 
 ```bash
 # Run with the provided test torrent
-./torrent-client big-buck-bunny.torrent
+./bin/torrent-client big-buck-bunny.torrent
 
 # Console Output:
 # Parsing torrent file...
@@ -83,10 +83,10 @@ file torrent-client
 ```bash
 # Extract and use magnet link from file
 MAGNET=$(cat magnets.txt | head -1)
-./torrent-client "$MAGNET"
+./bin/torrent-client "$MAGNET"
 
 # Or directly pass magnet link
-./torrent-client "magnet:?xt=urn:btih:8F7C6B1559607AFA3A4CEFB1836E9E8415E3355F&dn=..."
+./bin/torrent-client "magnet:?xt=urn:btih:8F7C6B1559607AFA3A4CEFB1836E9E8415E3355F&dn=..."
 
 # Console Output:
 # Parsing magnet link...
@@ -138,7 +138,7 @@ Download Complete
 
 ```bash
 $ cd /workspaces/Bit_torrent
-$ ./torrent-client big-buck-bunny.torrent
+$ ./bin/torrent-client big-buck-bunny.torrent
 
 Parsing torrent file...
 Torrent parsed. InfoHash: 8f7c6b1559607afa3a4cefb1836e9e8415e3355f
@@ -166,7 +166,7 @@ File assembled successfully at: /home/user/big_buck_bunny.mp4
 ### Example 2: Download from Magnet Link
 
 ```bash
-$ ./torrent-client "magnet:?xt=urn:btih:8F7C6B1559607AFA3A4CEFB1836E9E8415E3355F&dn=Big+Buck+Bunny"
+$ ./bin/torrent-client "magnet:?xt=urn:btih:8F7C6B1559607AFA3A4CEFB1836E9E8415E3355F&dn=Big+Buck+Bunny"
 
 Parsing magnet link...
 Magnet link parsed. InfoHash: 8f7c6b1559607afa3a4cefb1836e9e8415e3355f
@@ -224,12 +224,12 @@ chmod +x torrent-client
 ### Monitor Progress
 The client logs each piece download:
 ```bash
-./torrent-client file.torrent | tee download.log
+./bin/torrent-client file.torrent | tee download.log
 ```
 
 ### Check Available Peers
 ```bash
-./torrent-client file.torrent 2>&1 | grep "Found.*peers"
+./bin/torrent-client file.torrent 2>&1 | grep "Found.*peers"
 ```
 
 ---
@@ -240,23 +240,23 @@ The client logs each piece download:
 
 ```bash
 # Release build (smaller binary, faster)
-go build -ldflags="-s -w" -o torrent-client
+go build -ldflags="-s -w" -o bin/torrent-client ./cmd/torrent-client/
 
 # Debug build (includes symbols for debugging)
-go build -gcflags="all=-N -l" -o torrent-client-debug
+go build -gcflags="all=-N -l" -o bin/torrent-client-debug ./cmd/torrent-client/
 ```
 
 ### Cross-Compilation
 
 ```bash
 # Build for Linux
-GOOS=linux GOARCH=amd64 go build -o torrent-client-linux
+GOOS=linux GOARCH=amd64 go build -o bin/torrent-client-linux ./cmd/torrent-client/
 
 # Build for macOS
-GOOS=darwin GOARCH=amd64 go build -o torrent-client-mac
+GOOS=darwin GOARCH=amd64 go build -o bin/torrent-client-mac ./cmd/torrent-client/
 
 # Build for Windows
-GOOS=windows GOARCH=amd64 go build -o torrent-client.exe
+GOOS=windows GOARCH=amd64 go build -o bin/torrent-client.exe ./cmd/torrent-client/
 ```
 
 ---

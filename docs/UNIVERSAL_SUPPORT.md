@@ -47,7 +47,7 @@ func OpenTorrentFile(filePath string) (*TorrentFile, error) {
 
 ```bash
 # Download Ubuntu ISO torrent
-./torrent-client ubuntu-22.04-desktop-amd64.iso.torrent
+./bin/torrent-client ubuntu-22.04-desktop-amd64.iso.torrent
 
 # Expected output:
 # Parsing torrent file...
@@ -62,7 +62,7 @@ func OpenTorrentFile(filePath string) (*TorrentFile, error) {
 
 ```bash
 # Download Go compiler
-./torrent-client go1.23.0.linux-amd64.tar.gz.torrent
+./bin/torrent-client go1.23.0.linux-amd64.tar.gz.torrent
 
 # Expected output:
 # Torrent parsed. InfoHash: 9a8b7c6d5e4f...
@@ -75,7 +75,7 @@ func OpenTorrentFile(filePath string) (*TorrentFile, error) {
 
 ```bash
 # Download a complete project folder
-./torrent-client project-files.torrent
+./bin/torrent-client project-files.torrent
 
 # Your torrent contains multiple files:
 # ├── src/
@@ -98,13 +98,13 @@ func OpenTorrentFile(filePath string) (*TorrentFile, error) {
 
 ```bash
 # Movie torrent
-./torrent-client "magnet:?xt=urn:btih:MOVIE_HASH&tr=tracker1&tr=tracker2"
+./bin/torrent-client "magnet:?xt=urn:btih:MOVIE_HASH&tr=tracker1&tr=tracker2"
 
 # Software torrent  
-./torrent-client "magnet:?xt=urn:btih:SOFTWARE_HASH&dn=MyApp"
+./bin/torrent-client "magnet:?xt=urn:btih:SOFTWARE_HASH&dn=MyApp"
 
 # Archive torrent
-./torrent-client "magnet:?xt=urn:btih:ARCHIVE_HASH&tr=udp://tracker"
+./bin/torrent-client "magnet:?xt=urn:btih:ARCHIVE_HASH&tr=udp://tracker"
 ```
 
 ---
@@ -203,7 +203,7 @@ wget http://example.com/tv-series-season1.torrent
 
 ```bash
 # Download Arch Linux
-./torrent-client arch-linux-x86_64.iso.torrent
+./bin/torrent-client arch-linux-x86_64.iso.torrent
 
 # Result: 700 MB ISO file ready to burn
 # $HOME/arch-linux-x86_64.iso
@@ -213,7 +213,7 @@ wget http://example.com/tv-series-season1.torrent
 
 ```bash
 # Download Go source code
-./torrent-client go-src.tar.gz.torrent
+./bin/torrent-client go-src.tar.gz.torrent
 
 # Result: Compressed archive ready to extract
 # $HOME/go-src.tar.gz
@@ -225,7 +225,7 @@ wget http://example.com/tv-series-season1.torrent
 # Download multiple torrents in sequence
 for torrent in *.torrent; do
     echo "Downloading: $torrent"
-    ./torrent-client "$torrent"
+    ./bin/torrent-client "$torrent"
     echo "Completed: $torrent"
 done
 ```
@@ -297,10 +297,10 @@ cp /path/to/downloaded/file.torrent ./my-file.torrent
 ### Step 3: Run the Client
 
 ```bash
-./torrent-client my-file.torrent
+./bin/torrent-client my-file.torrent
 
 # OR with magnet link
-./torrent-client "magnet:?xt=urn:btih:YOUR_HASH&tr=tracker"
+./bin/torrent-client "magnet:?xt=urn:btih:YOUR_HASH&tr=tracker"
 ```
 
 ### Step 4: Wait for Download
@@ -352,7 +352,7 @@ const numGoroutine = 4  // Change to 8 or 16 for faster downloads
 
 Start downloading anything you want:
 ```bash
-./torrent-client any-torrent-file.torrent
+./bin/torrent-client any-torrent-file.torrent
 # or
-./torrent-client "magnet:?xt=urn:btih:..."
+./bin/torrent-client "magnet:?xt=urn:btih:..."
 ```
