@@ -4,27 +4,29 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
+	"encoding/base32"
+	"encoding/hex"
 	"fmt"
-	"os"
 	"net/url"
+	"os"
 	"strings"
 
 	bencode "github.com/jackpal/bencode-go"
 )
 
 type bencodeTorrent struct {
-	Announce     string     `bencode:"announce"`
-	AnnounceList [][]string `bencode:"announce-list"`
+	Announce     string      `bencode:"announce"`
+	AnnounceList [][]string  `bencode:"announce-list"`
 	Info         bencodeInfo `bencode:"info"`
 }
 
 type bencodeInfo struct {
-	Name        string       `bencode:"name"`
-	PieceLength int64        `bencode:"piece length"`
-	Pieces      string       `bencode:"pieces"`
-	Length      int64        `bencode:"length"`
+	Name        string        `bencode:"name"`
+	PieceLength int64         `bencode:"piece length"`
+	Pieces      string        `bencode:"pieces"`
+	Length      int64         `bencode:"length"`
 	Files       []bencodeFile `bencode:"files"`
-	Private     int64        `bencode:"private"`
+	Private     int64         `bencode:"private"`
 }
 
 type bencodeFile struct {
@@ -109,80 +111,72 @@ func ParseMagnetLink(magnetLink string) (*MagnetLink, error) {
 		return nil, fmt.Errorf("invalid magnet link format")
 	}
 
-	link := &MagnetLink{}
-
-	// Parse the URI
-	query := strings.TrimPrefix(magnetLink, "magnet:?")
-	params := strings.Split(query, "&")
-
-	for _, param := range params {
-		parts := strings.Split(param, "=")
-		if len(parts) != 2 {
-			continue
-		}
-
-		key := parts[0]
-		value, err := url.QueryUnescape(parts[1])
-		if err != nil {
-			continue
-		}
-
-		switch key {
-		case "xt":
-			// Extract info hash from urn:btih:...
-			if strings.HasPrefix(value, "urn:btih:") {
-				hashStr := strings.TrimPrefix(value, "urn:btih:")
-				// Convert hex string to bytes
-				if len(hashStr) == 40 {
-					// Hex encoded
-					hex := make([]byte, 20)
-					for i := 0; i < 20; i++ {
-						fmt.Sscanf(hashStr[i*2:i*2+2], "%x", &hex[i])
-					}
-					copy(link.InfoHash[:], hex)
-				} else if len(hashStr) == 32 {
-					// Base32 encoded (RFC 3548)
-					link.InfoHash = Base32ToInfoHash(hashStr)
-				}
-			}
-		case "dn":
-			link.Name = value
-		case "tr":
-			link.Trackers = append(link.Trackers, value)
-		case "x.pe":
-			link.PeerAddrs = append(link.PeerAddrs, value)
-		}
+	params, err := url.ParseQuery(strings.TrimPrefix(magnetLink, "magnet:?"))
+	if err != nil {
+		return nil, fmt.Errorf("parse magnet query: %w", err)
 	}
 
-	return link, nil
+	link := &MagnetLink{
+		Trackers:  append([]string(nil), params["tr"]...),
+		PeerAddrs: append([]string(nil), params["x.pe"]...),
+	}
+	if dn := params.Get("dn"); dn != "" {
+		link.Name = dn
+	}
+
+	var hashErr error
+	for _, xt := range params["xt"] {
+		if !strings.HasPrefix(xt, "urn:btih:") {
+			continue
+		}
+
+		link.InfoHash, err = decodeInfoHash(strings.TrimPrefix(xt, "urn:btih:"))
+		if err == nil {
+			return link, nil
+		}
+		hashErr = err
+	}
+
+	if hashErr != nil {
+		return nil, fmt.Errorf("invalid magnet info hash: %w", hashErr)
+	}
+	return nil, fmt.Errorf("magnet link is missing xt=urn:btih:<infohash>")
 }
 
 // Base32ToInfoHash converts a base32 encoded string to a 20-byte info hash.
 func Base32ToInfoHash(encoded string) [20]byte {
-	// Base32 alphabet used in BitTorrent
-	const base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-
 	var hash [20]byte
-	var bits uint64
-	var bitCount int
-
-	for _, char := range encoded {
-		idx := strings.IndexRune(base32Alphabet, char)
-		if idx < 0 {
-			continue
-		}
-
-		bits = (bits << 5) | uint64(idx)
-		bitCount += 5
-
-		if bitCount >= 8 {
-			bitCount -= 8
-			byteIndex := (len(encoded)*5/8 - bitCount/8 - 1)
-			if byteIndex >= 0 && byteIndex < 20 {
-				hash[byteIndex] = byte((bits >> uint(bitCount)) & 0xFF)
-			}
-		}
+	decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(strings.TrimSpace(encoded)))
+	if err != nil || len(decoded) != len(hash) {
+		return hash
 	}
-
+	copy(hash[:], decoded)
 	return hash
+}
+
+func decodeInfoHash(value string) ([20]byte, error) {
+	var hash [20]byte
+
+	trimmed := strings.TrimSpace(value)
+	switch len(trimmed) {
+	case 40:
+		decoded, err := hex.DecodeString(trimmed)
+		if err != nil {
+			return hash, err
+		}
+		copy(hash[:], decoded)
+		return hash, nil
+	case 32:
+		decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(trimmed))
+		if err != nil {
+			return hash, err
+		}
+		if len(decoded) != len(hash) {
+			return hash, fmt.Errorf("decoded base32 info hash has %d bytes", len(decoded))
+		}
+		copy(hash[:], decoded)
+		return hash, nil
+	default:
+		return hash, fmt.Errorf("unsupported info hash length %d", len(trimmed))
+	}
 }
