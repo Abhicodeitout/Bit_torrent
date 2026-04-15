@@ -15,9 +15,9 @@ import (
 )
 
 type bencodeTorrent struct {
-	Announce     string      `bencode:"announce"`
-	AnnounceList [][]string  `bencode:"announce-list"`
-	Info         bencodeInfo `bencode:"info"`
+	Announce     string       `bencode:"announce"`
+	AnnounceList [][]string   `bencode:"announce-list"`
+	Info         *bencodeInfo `bencode:"info"`
 }
 
 type bencodeInfo struct {
@@ -54,6 +54,10 @@ func OpenTorrentFile(filePath string) (*TorrentFile, error) {
 	err = bencode.Unmarshal(file, &raw)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse torrent file: %v", err)
+	}
+
+	if raw.Info == nil {
+		return nil, fmt.Errorf("torrent file missing required 'info' dictionary")
 	}
 
 	torrent := &TorrentFile{}

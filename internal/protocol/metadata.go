@@ -18,6 +18,39 @@ import (
 // MsgExtended is the BEP 10 extension protocol message ID.
 const MsgExtended = 20
 
+type MetadataProgressFunc func(string)
+
+type extensionHandshake struct {
+	MetadataSize int64                   `bencode:"metadata_size"`
+	Extensions   *extensionHandshakeMap `bencode:"m"`
+}
+
+type extensionHandshakeMap struct {
+	UTMetadata int64 `bencode:"ut_metadata"`
+}
+
+type metadataMessage struct {
+	MsgType   int64 `bencode:"msg_type"`
+	Piece     int64 `bencode:"piece"`
+	TotalSize int64 `bencode:"total_size"`
+}
+
+type infoDict struct {
+	Name        string         `bencode:"name"`
+	Length      int64          `bencode:"length"`
+	PieceLength int64          `bencode:"piece length"`
+	Pieces      string         `bencode:"pieces"`
+	Private     int64          `bencode:"private"`
+	Files       []infoDictFile `bencode:"files"`
+}
+
+type infoDictFile struct {
+	Length int64    `bencode:"length"`
+	Path   []string `bencode:"path"`
+}
+
+type bencodeValue = interface{}
+
 // handshakeWithExtBit sends a BitTorrent handshake with the BEP 10 extension bit
 // set in the reserved bytes, and returns the remote peer-ID and whether the peer
 // also advertises extension support.
@@ -68,6 +101,10 @@ func handshakeWithExtBit(conn net.Conn, infoHash [20]byte, peerID [20]byte) ([20
 // the Extension Protocol (BEP 10) and the ut_metadata extension (BEP 9).
 // The caller is responsible for closing conn after this returns.
 func FetchMetadata(conn net.Conn, infoHash [20]byte, peerID [20]byte) (*types.TorrentInfo, error) {
+	return fetchMetadata(conn, infoHash, peerID, "", nil)
+}
+
+func fetchMetadata(conn net.Conn, infoHash [20]byte, peerID [20]byte, peerLabel string, progress MetadataProgressFunc) (*types.TorrentInfo, error) {
 	_, supportsExt, err := handshakeWithExtBit(conn, infoHash, peerID)
 	if err != nil {
 		return nil, err
@@ -108,17 +145,21 @@ func FetchMetadata(conn net.Conn, infoHash [20]byte, peerID [20]byte) (*types.To
 		if msg.ID != MsgExtended || len(msg.Payload) == 0 || msg.Payload[0] != 0 {
 			continue
 		}
-		var peerHS map[string]interface{}
-		if err := bencode.Unmarshal(bytes.NewReader(msg.Payload[1:]), &peerHS); err != nil {
+		value, _, err := decodeBencodeValue(msg.Payload[1:])
+		if err != nil {
 			continue
 		}
-		if m, ok := peerHS["m"].(map[string]interface{}); ok {
-			if id, ok := m["ut_metadata"].(int64); ok {
+		peerHS, ok := value.(map[string]bencodeValue)
+		if !ok {
+			continue
+		}
+		if extMap, ok := peerHS["m"].(map[string]bencodeValue); ok {
+			if id, ok := extMap["ut_metadata"].(int64); ok {
 				peerMetaID = id
 			}
 		}
-		if sz, ok := peerHS["metadata_size"].(int64); ok {
-			metadataSize = sz
+		if size, ok := peerHS["metadata_size"].(int64); ok {
+			metadataSize = size
 		}
 		break
 	}
@@ -133,6 +174,7 @@ func FetchMetadata(conn net.Conn, infoHash [20]byte, peerID [20]byte) (*types.To
 	// ── Fetch metadata pieces ─────────────────────────────────────────────────
 	const metaPieceSize = 16384
 	numPieces := int((metadataSize + metaPieceSize - 1) / metaPieceSize)
+	reportMetadataProgress(progress, "Metadata: peer %s advertised %d bytes across %d piece(s)", peerLabel, metadataSize, numPieces)
 	assembled := make([]byte, metadataSize)
 
 	for i := 0; i < numPieces; i++ {
@@ -166,8 +208,12 @@ func FetchMetadata(conn net.Conn, infoHash [20]byte, peerID [20]byte) (*types.To
 				continue
 			}
 
-			var resp map[string]interface{}
-			if err := bencode.Unmarshal(bytes.NewReader(msg.Payload[1:1+dictLen]), &resp); err != nil {
+			value, _, err := decodeBencodeValue(msg.Payload[1 : 1+dictLen])
+			if err != nil {
+				continue
+			}
+			resp, ok := value.(map[string]bencodeValue)
+			if !ok {
 				continue
 			}
 
@@ -177,6 +223,9 @@ func FetchMetadata(conn net.Conn, infoHash [20]byte, peerID [20]byte) (*types.To
 				raw := msg.Payload[1+dictLen:]
 				offset := i * metaPieceSize
 				copy(assembled[offset:], raw)
+				if shouldReportMetadataPiece(i, numPieces) {
+					reportMetadataProgress(progress, "Metadata: received piece %d/%d from %s", i+1, numPieces, peerLabel)
+				}
 				goto nextPiece
 			case 2: // reject
 				return nil, fmt.Errorf("peer rejected metadata piece %d", i)
@@ -190,6 +239,7 @@ func FetchMetadata(conn net.Conn, infoHash [20]byte, peerID [20]byte) (*types.To
 	if sha1.Sum(assembled) != infoHash {
 		return nil, fmt.Errorf("metadata SHA1 mismatch — corrupted data from peer")
 	}
+	reportMetadataProgress(progress, "Metadata: validated info dictionary from %s", peerLabel)
 
 	return decodeInfoDict(assembled)
 }
@@ -197,6 +247,12 @@ func FetchMetadata(conn net.Conn, infoHash [20]byte, peerID [20]byte) (*types.To
 // FetchMetadataFromPeers tries each peer in order, returning the TorrentInfo
 // from the first peer that provides valid metadata.
 func FetchMetadataFromPeers(peers []types.Peer, infoHash [20]byte, peerID [20]byte) (*types.TorrentInfo, error) {
+	return FetchMetadataFromPeersWithProgress(peers, infoHash, peerID, nil)
+}
+
+// FetchMetadataFromPeersWithProgress tries peers in parallel and emits progress
+// messages while discovering metadata.
+func FetchMetadataFromPeersWithProgress(peers []types.Peer, infoHash [20]byte, peerID [20]byte, progress MetadataProgressFunc) (*types.TorrentInfo, error) {
 	if len(peers) == 0 {
 		return nil, fmt.Errorf("no peers to fetch metadata from")
 	}
@@ -232,9 +288,11 @@ func FetchMetadataFromPeers(peers []types.Peer, infoHash [20]byte, peerID [20]by
 					}
 
 					addr := net.JoinHostPort(peer.IP.String(), fmt.Sprintf("%d", peer.Port))
+					reportMetadataProgress(progress, "Metadata: trying peer %s", addr)
 					dialer := net.Dialer{Timeout: 10 * time.Second}
 					conn, err := dialer.DialContext(ctx, "tcp", addr)
 					if err != nil {
+						reportMetadataProgress(progress, "Metadata: peer %s dial failed: %v", addr, err)
 						select {
 						case resultCh <- result{err: fmt.Errorf("%s: dial: %w", addr, err)}:
 						case <-ctx.Done():
@@ -242,15 +300,17 @@ func FetchMetadataFromPeers(peers []types.Peer, infoHash [20]byte, peerID [20]by
 						continue
 					}
 
-					info, err := FetchMetadata(conn, infoHash, peerID)
+					info, err := fetchMetadataWithRecovery(conn, infoHash, peerID, addr, progress)
 					_ = conn.Close()
 					if err == nil {
+						reportMetadataProgress(progress, "Metadata: peer %s returned valid metadata", addr)
 						select {
 						case resultCh <- result{info: info}:
 						case <-ctx.Done():
 						}
 						return
 					}
+					reportMetadataProgress(progress, "Metadata: peer %s failed: %v", addr, err)
 
 					select {
 					case resultCh <- result{err: fmt.Errorf("%s: %w", addr, err)}:
@@ -291,11 +351,44 @@ func FetchMetadataFromPeers(peers []types.Peer, infoHash [20]byte, peerID [20]by
 	return nil, fmt.Errorf("failed to fetch metadata from any of %d peers: %s", len(peers), strings.Join(errSummaries, "; "))
 }
 
+func fetchMetadataWithRecovery(conn net.Conn, infoHash [20]byte, peerID [20]byte, peerLabel string, progress MetadataProgressFunc) (info *types.TorrentInfo, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("panic during metadata fetch: %v", recovered)
+			reportMetadataProgress(progress, "Metadata: peer %s panicked: %v", peerLabel, recovered)
+		}
+	}()
+
+	return fetchMetadata(conn, infoHash, peerID, peerLabel, progress)
+}
+
+func reportMetadataProgress(progress MetadataProgressFunc, format string, args ...interface{}) {
+	if progress == nil {
+		return
+	}
+	progress(fmt.Sprintf(format, args...))
+}
+
+func shouldReportMetadataPiece(pieceIndex, totalPieces int) bool {
+	if totalPieces <= 8 {
+		return true
+	}
+	if pieceIndex == 0 || pieceIndex == totalPieces-1 {
+		return true
+	}
+	return (pieceIndex+1)%8 == 0
+}
+
 // decodeInfoDict parses a raw bencoded info-dictionary into a TorrentInfo.
 func decodeInfoDict(data []byte) (*types.TorrentInfo, error) {
-	var raw map[string]interface{}
-	if err := bencode.Unmarshal(bytes.NewReader(data), &raw); err != nil {
+	value, _, err := decodeBencodeValue(data)
+	if err != nil {
 		return nil, fmt.Errorf("decode info dict: %w", err)
+	}
+
+	raw, ok := value.(map[string]bencodeValue)
+	if !ok {
+		return nil, fmt.Errorf("decode info dict: unexpected top-level type %T", value)
 	}
 
 	info := &types.TorrentInfo{}
@@ -316,25 +409,32 @@ func decodeInfoDict(data []byte) (*types.TorrentInfo, error) {
 			info.PieceHashes = append(info.PieceHashes, h)
 		}
 	}
-	if l, ok := raw["length"].(int64); ok {
-		info.Length = l
-	} else if files, ok := raw["files"].([]interface{}); ok {
+	if length, ok := raw["length"].(int64); ok {
+		info.Length = length
+	} else {
+		files, ok := raw["files"].([]bencodeValue)
+		if !ok {
+			files = nil
+		}
 		for _, f := range files {
-			fm, ok := f.(map[string]interface{})
+			fm, ok := f.(map[string]bencodeValue)
 			if !ok {
 				continue
 			}
 			fLen, _ := fm["length"].(int64)
 			info.Length += fLen
-			if pathRaw, ok := fm["path"].([]interface{}); ok {
-				var path []string
-				for _, p := range pathRaw {
-					if ps, ok := p.(string); ok {
-						path = append(path, ps)
+			var path []string
+			if parts, ok := fm["path"].([]bencodeValue); ok {
+				for _, part := range parts {
+					if s, ok := part.(string); ok {
+						path = append(path, s)
 					}
 				}
-				info.Files = append(info.Files, types.FileInfo{Length: fLen, Path: path})
 			}
+			info.Files = append(info.Files, types.FileInfo{
+				Length: fLen,
+				Path:   path,
+			})
 		}
 	}
 
@@ -342,6 +442,85 @@ func decodeInfoDict(data []byte) (*types.TorrentInfo, error) {
 		return nil, fmt.Errorf("info dict contains no piece hashes")
 	}
 	return info, nil
+}
+
+func decodeBencodeValue(data []byte) (bencodeValue, int, error) {
+	if len(data) == 0 {
+		return nil, 0, fmt.Errorf("empty bencode data")
+	}
+
+	switch data[0] {
+	case 'i':
+		end := bytes.IndexByte(data, 'e')
+		if end == -1 {
+			return nil, 0, fmt.Errorf("unterminated integer")
+		}
+		var value int64
+		if _, err := fmt.Sscanf(string(data[1:end]), "%d", &value); err != nil {
+			return nil, 0, fmt.Errorf("parse integer: %w", err)
+		}
+		return value, end + 1, nil
+	case 'l':
+		items := make([]bencodeValue, 0)
+		pos := 1
+		for pos < len(data) && data[pos] != 'e' {
+			item, n, err := decodeBencodeValue(data[pos:])
+			if err != nil {
+				return nil, 0, err
+			}
+			items = append(items, item)
+			pos += n
+		}
+		if pos >= len(data) || data[pos] != 'e' {
+			return nil, 0, fmt.Errorf("unterminated list")
+		}
+		return items, pos + 1, nil
+	case 'd':
+		items := make(map[string]bencodeValue)
+		pos := 1
+		for pos < len(data) && data[pos] != 'e' {
+			keyValue, n, err := decodeBencodeValue(data[pos:])
+			if err != nil {
+				return nil, 0, err
+			}
+			key, ok := keyValue.(string)
+			if !ok {
+				return nil, 0, fmt.Errorf("dictionary key is not a string")
+			}
+			pos += n
+			value, n, err := decodeBencodeValue(data[pos:])
+			if err != nil {
+				return nil, 0, err
+			}
+			items[key] = value
+			pos += n
+		}
+		if pos >= len(data) || data[pos] != 'e' {
+			return nil, 0, fmt.Errorf("unterminated dictionary")
+		}
+		return items, pos + 1, nil
+	default:
+		if data[0] < '0' || data[0] > '9' {
+			return nil, 0, fmt.Errorf("unexpected bencode token %q", data[0])
+		}
+		colon := bytes.IndexByte(data, ':')
+		if colon == -1 {
+			return nil, 0, fmt.Errorf("string length missing colon")
+		}
+		length := 0
+		for _, ch := range data[:colon] {
+			if ch < '0' || ch > '9' {
+				return nil, 0, fmt.Errorf("invalid string length")
+			}
+			length = length*10 + int(ch-'0')
+		}
+		start := colon + 1
+		end := start + length
+		if end > len(data) {
+			return nil, 0, fmt.Errorf("string data truncated")
+		}
+		return string(data[start:end]), end, nil
+	}
 }
 
 // bencodeLen returns the number of bytes occupied by the first bencode value in data.

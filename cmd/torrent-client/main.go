@@ -30,6 +30,13 @@ var publicTrackerFallback = []string{
 	"udp://tracker.dler.org:6969/announce",
 }
 
+var preferredMagnetTrackers = []string{
+	"udp://tracker.opentrackr.org:1337/announce",
+	"udp://open.stealth.si:80/announce",
+	"udp://tracker.torrent.eu.org:451/announce",
+	"udp://tracker.dler.org:6969/announce",
+}
+
 func main() {
 	fs := flag.NewFlagSet("torrent-client", flag.ExitOnError)
 	quiet := fs.Bool("quiet", false, "suppress downloader progress/stats output")
@@ -126,7 +133,10 @@ func main() {
 
 		// Minimal struct used only for tracker HTTP announces (needs InfoHash).
 		torrentFile = &types.TorrentFile{InfoHash: magnet.InfoHash}
-		trackerURLs = buildTrackerURLList(magnet.Trackers, true)
+		trackerURLs = buildMagnetTrackerURLList(magnet.Trackers)
+		if *verbose {
+			fmt.Printf("Using %d prioritized trackers for magnet bootstrap\n", len(trackerURLs))
+		}
 
 		peers = gatherPeers(magnet.InfoHash, trackerURLs, torrentFile, peerID, opts.ListenPort, "started")
 		if len(magnet.PeerAddrs) > 0 {
@@ -153,7 +163,16 @@ func main() {
 		peers = dedupePeers(peers)
 		fmt.Printf("Found %d peers — fetching torrent metadata via BEP 9...\n", len(peers))
 
-		info, err := protocol.FetchMetadataFromPeers(peers, magnet.InfoHash, peerID)
+		var metadataProgress protocol.MetadataProgressFunc
+		if *verbose {
+			metadataProgress = func(message string) {
+				if strings.Contains(message, "returned valid metadata") {
+					fmt.Println(message)
+				}
+			}
+		}
+
+		info, err := protocol.FetchMetadataFromPeersWithProgress(peers, magnet.InfoHash, peerID, metadataProgress)
 		if err != nil {
 			fmt.Println("Failed to fetch metadata:", err)
 			os.Exit(1)
@@ -164,6 +183,9 @@ func main() {
 			len(info.PieceHashes), info.Length)
 		if info.Private {
 			fmt.Println("Metadata indicates private torrent; DHT discovery is disabled for download phase.")
+		}
+		if outPath, err := downloader.PlannedOutputPath(torrentFile); err == nil {
+			fmt.Printf("Download destination: %s\n", outPath)
 		}
 
 		provider, _ := downloader.OpenSeedStore(torrentFile)
@@ -339,6 +361,48 @@ func buildTrackerURLList(trackers []string, includePublicFallback bool) []string
 		}
 	}
 	return list
+}
+
+// buildMagnetTrackerURLList returns a short, reliable tracker list so magnets
+// can move to BEP 9 metadata fetching quickly instead of waiting on many slow
+// or dead trackers.
+func buildMagnetTrackerURLList(trackers []string) []string {
+	const maxMagnetTrackers = 6
+
+	base := buildTrackerURLList(trackers, true)
+	if len(base) == 0 {
+		return base
+	}
+
+	seen := make(map[string]struct{}, len(base))
+	prioritized := make([]string, 0, maxMagnetTrackers)
+	add := func(u string) {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			return
+		}
+		if _, ok := seen[u]; ok {
+			return
+		}
+		seen[u] = struct{}{}
+		prioritized = append(prioritized, u)
+	}
+
+	for _, tr := range preferredMagnetTrackers {
+		add(tr)
+		if len(prioritized) >= maxMagnetTrackers {
+			return prioritized
+		}
+	}
+
+	for _, tr := range base {
+		add(tr)
+		if len(prioritized) >= maxMagnetTrackers {
+			break
+		}
+	}
+
+	return prioritized
 }
 
 // buildTrackerList returns a deduplicated, flat list of all tracker URLs from a

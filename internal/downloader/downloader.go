@@ -35,18 +35,26 @@ var publicTrackerFallback = []string{
 
 const (
 	blockSize    = 16 * 1024 // 16 KB
-	numGoroutine = 10
-	connTimeout  = 10 * time.Second
+	numGoroutine = 24
+	connTimeout  = 3 * time.Second // fast-fail unreachable peers
 
-	peerQueueCapacity = 512
+	peerQueueCapacity = 1024
 	discoveryInterval = 25 * time.Second
 	stateSaveInterval = 3 * time.Second
 
 	maxPieceAttempts      = 12
-	maxPiecesPerSession   = 8
+	maxPiecesPerSession   = 32
+	minInflightPerPeer    = 4
+	defaultInflightPeer   = 8
+	maxInflightPerPeer    = 16
 	endgameThreshold      = 12
 	endgameInjectInterval = 2 * time.Second
-	statsLogInterval      = 10 * time.Second
+	statsLogInterval      = 3 * time.Second
+
+	// Pre-connection pool: connector goroutines establish sessions in the
+	// background so download workers never stall on TCP connect/handshake.
+	numConnectors   = 48
+	sessionPoolSize = 64
 )
 
 type resumeState struct {
@@ -159,6 +167,7 @@ type peerSession struct {
 	unchoked  bool
 	servedCnt int
 	utPexID   int
+	inflight  int
 }
 
 type peerStat struct {
@@ -220,14 +229,68 @@ func DownloadTorrent(torrent *types.TorrentFile, peers []types.Peer, peerID [20]
 	return DownloadTorrentWithOptions(torrent, peers, peerID, DefaultDownloadOptions())
 }
 
+// PlannedOutputPath returns the path where downloaded content will be written.
+func PlannedOutputPath(torrent *types.TorrentFile) (string, error) {
+	if torrent == nil {
+		return "", fmt.Errorf("nil torrent")
+	}
+	plan, err := buildOutputPlan(torrent)
+	if err != nil {
+		return "", err
+	}
+	return plan.displayPath, nil
+}
+
 // DownloadTorrentWithOptions downloads pieces with caller-controlled options.
 func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, peerID [20]byte, opts DownloadOptions) error {
 	if torrent == nil || len(torrent.Info.PieceHashes) == 0 {
 		return fmt.Errorf("invalid torrent or no pieces to download")
 	}
 
+	var (
+		progressMu      sync.Mutex
+		progressVisible bool
+		progressWidth   int
+		lastProgress    string
+	)
+
+	finishProgressLine := func() {
+		if !opts.Verbose {
+			return
+		}
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		if progressVisible {
+			fmt.Print("\n")
+			progressVisible = false
+			progressWidth = 0
+			lastProgress = ""
+		}
+	}
+
+	writeProgressLine := func(line string) {
+		if !opts.Verbose {
+			return
+		}
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		if line == lastProgress {
+			return
+		}
+		padding := ""
+		if progressWidth > len(line) {
+			padding = strings.Repeat(" ", progressWidth-len(line))
+		}
+		fmt.Printf("\r%s%s", line, padding)
+		progressVisible = true
+		progressWidth = len(line)
+		lastProgress = line
+	}
+	defer finishProgressLine()
+
 	logf := func(format string, args ...interface{}) {
 		if opts.Verbose {
+			finishProgressLine()
 			fmt.Printf(format, args...)
 		}
 	}
@@ -335,6 +398,9 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 		go func() {
 			ticker := time.NewTicker(statsLogInterval)
 			defer ticker.Stop()
+			prevBytes := downloadedBytes
+			prevAt := time.Now()
+			var smoothRate float64
 			for {
 				select {
 				case <-ctx.Done():
@@ -342,19 +408,54 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 				case <-ticker.C:
 					snap := pool.Snapshot()
 					done := atomic.LoadInt64(&completedCount)
-					logf(
-						"Stats: pieces=%d/%d queue=%d peers(total=%d available=%d backoff=%d quarantine=%d) success=%d failures=%d avg-latency=%s\n",
+					now := time.Now()
+					currentBytes := atomic.LoadInt64(&downloadedBytes)
+					deltaBytes := currentBytes - prevBytes
+					deltaSeconds := now.Sub(prevAt).Seconds()
+					var instantRate float64
+					if deltaSeconds > 0 {
+						instantRate = float64(deltaBytes) / deltaSeconds
+					}
+					// Exponential moving average: stays non-zero between bursts.
+					if smoothRate == 0 && instantRate > 0 {
+						smoothRate = instantRate
+					} else {
+						smoothRate = smoothRate*0.7 + instantRate*0.3
+					}
+					rate := smoothRate
+					prevBytes = currentBytes
+					prevAt = now
+
+					left := torrent.Info.Length - currentBytes
+					if left < 0 {
+						left = 0
+					}
+
+					eta := "--"
+					if rate > 0 && left > 0 {
+						eta = formatETA(time.Duration(float64(left)/rate) * time.Second)
+					} else if left == 0 {
+						eta = "0s"
+					}
+
+					progressPct := float64(0)
+					if torrent.Info.Length > 0 {
+						progressPct = (float64(currentBytes) / float64(torrent.Info.Length)) * 100
+					}
+
+					writeProgressLine(fmt.Sprintf(
+						"Progress: %.1f%% pieces=%d/%d down=%s/%s speed=%s peers=%d ok=%d fail=%d eta=%s",
+						progressPct,
 						done,
 						numPieces,
-						len(pieceQueue),
-						snap.totalPeers,
+						formatBytes(currentBytes),
+						formatBytes(torrent.Info.Length),
+						formatRate(rate),
 						snap.availablePeers,
-						snap.backoffPeers,
-						snap.quarantinePeers,
 						snap.totalSuccesses,
 						snap.totalFailures,
-						snap.avgLatency.Truncate(10*time.Millisecond),
-					)
+						eta,
+					))
 				}
 			}
 		}()
@@ -392,12 +493,55 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 		}()
 	}
 
+	// Pre-connection pool: connector goroutines establish peer sessions ahead
+	// of time so download workers pull a ready session without stalling on TCP.
+	readySessions := make(chan *peerSession, sessionPoolSize)
+	for i := 0; i < numConnectors; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				peer, err := pool.Acquire(ctx)
+				if err != nil {
+					return
+				}
+				newSess, err := newPeerSession(peer, torrent, peerID, pool.Add)
+				if err != nil {
+					pool.ReportFailureWith(peer, classifyError(err))
+					pool.Release(peer)
+					continue
+				}
+				slog.logEvent("peer_connected", map[string]interface{}{"peer": peerKey(newSess.peer)})
+				select {
+				case readySessions <- newSess:
+				case <-ctx.Done():
+					newSess.conn.Close() //nolint:errcheck
+					pool.Release(newSess.peer)
+					return
+				}
+			}
+		}()
+	}
+
 	var workers sync.WaitGroup
 	workerCount := numGoroutine
 	for i := 0; i < workerCount; i++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					slog.logEvent("worker_panic", map[string]interface{}{
+						"panic": fmt.Sprintf("%v", recovered),
+					})
+					if opts.Verbose {
+						fmt.Printf("Worker recovered from panic: %v\n", recovered)
+					}
+				}
+			}()
 			var sess *peerSession
 			defer func() {
 				if sess != nil {
@@ -432,23 +576,13 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 					for attempt := 0; attempt < maxPieceAttempts; attempt++ {
 						if sess == nil || sess.servedCnt >= maxPiecesPerSession {
 							releaseSession()
-							peer, err := pool.Acquire(ctx)
-							if err != nil {
+							// Pull a pre-connected session; connector goroutines
+							// continuously replenish the pool in the background.
+							select {
+							case sess = <-readySessions:
+							case <-ctx.Done():
 								return
 							}
-							newSession, err := newPeerSession(peer, torrent, peerID, pool.Add)
-							if err != nil {
-								pool.ReportFailureWith(peer, classifyError(err))
-								pool.Release(peer)
-								slog.logEvent("peer_fail", map[string]interface{}{
-									"peer":  peerKey(peer),
-									"class": classifyError(err),
-									"err":   err.Error(),
-								})
-								continue
-							}
-							sess = newSession
-							slog.logEvent("peer_connected", map[string]interface{}{"peer": peerKey(sess.peer)})
 						}
 
 						started := time.Now()
@@ -460,13 +594,16 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 							}
 							if errors.Is(err, errPeerMissingPiece) {
 								pool.ReportFailureWith(sess.peer, FailClassGeneral)
+								tuneInflightOnFailure(sess, FailClassGeneral)
 								releaseSession()
 								continue
 							}
-							pool.ReportFailureWith(sess.peer, classifyError(err))
+							fclass := classifyError(err)
+							pool.ReportFailureWith(sess.peer, fclass)
+							tuneInflightOnFailure(sess, fclass)
 							slog.logEvent("peer_fail", map[string]interface{}{
 								"peer":  peerKey(sess.peer),
-								"class": classifyError(err),
+								"class": fclass,
 								"err":   err.Error(),
 							})
 							releaseSession()
@@ -475,10 +612,13 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 
 						if err := writePiece(file, torrent, pieceIdx, pieceData); err != nil {
 							pool.ReportFailureWith(sess.peer, FailClassIO)
+							tuneInflightOnFailure(sess, FailClassIO)
 							releaseSession()
 							continue
 						}
-						pool.ReportSuccess(sess.peer, len(pieceData), time.Since(started))
+						latency := time.Since(started)
+						pool.ReportSuccess(sess.peer, len(pieceData), latency)
+						tuneInflightOnSuccess(sess, latency)
 
 						stateMu.Lock()
 						if !completed[pieceIdx] {
@@ -498,13 +638,16 @@ func DownloadTorrentWithOptions(torrent *types.TorrentFile, peers []types.Peer, 
 							slog.logEvent("piece_complete", map[string]interface{}{
 								"piece":      pieceIdx,
 								"peer":       peerKey(sess.peer),
-								"latency_ms": time.Since(started).Milliseconds(),
+								"latency_ms": latency.Milliseconds(),
+								"inflight":   sess.inflight,
 							})
 							remainingNow := numPieces - int(current)
 							if remainingNow <= endgameThreshold {
 								startEndgame()
 							}
-							logf("Piece %d complete (%d/%d)\n", pieceIdx, current, numPieces)
+							if current == int64(numPieces) {
+								logf("Piece %d complete (%d/%d)\n", pieceIdx, current, numPieces)
+							}
 						} else {
 							stateMu.Unlock()
 						}
@@ -786,20 +929,20 @@ func (p *peerPool) ReportFailureWith(peer types.Peer, class FailureClass) {
 		quarantineAfter = 3
 		quarantinePeriod = 10 * time.Minute
 	case FailClassTimeout:
-		// Network latency; moderate backoff.
-		baseBackoff = 2 * time.Second
-		quarantineAfter = 6
-		quarantinePeriod = 2 * time.Minute
+		// Network latency is common on public swarms; retry sooner.
+		baseBackoff = 750 * time.Millisecond
+		quarantineAfter = 12
+		quarantinePeriod = 45 * time.Second
 	case FailClassHashMismatch:
 		// Data corruption; quarantine immediately.
 		baseBackoff = 30 * time.Second
 		quarantineAfter = 2
 		quarantinePeriod = 15 * time.Minute
 	case FailClassChoked:
-		// Peer choked us; short wait and retry.
-		baseBackoff = 1 * time.Second
-		quarantineAfter = 10
-		quarantinePeriod = 1 * time.Minute
+		// Choking is normal; keep the peer in rotation.
+		baseBackoff = 300 * time.Millisecond
+		quarantineAfter = 20
+		quarantinePeriod = 30 * time.Second
 	case FailClassProtocol:
 		// Bad protocol; quarantine sooner.
 		baseBackoff = 3 * time.Second
@@ -811,9 +954,9 @@ func (p *peerPool) ReportFailureWith(peer types.Peer, class FailureClass) {
 		quarantineAfter = 999
 		quarantinePeriod = 0
 	default:
-		baseBackoff = 500 * time.Millisecond
-		quarantineAfter = 6
-		quarantinePeriod = 2 * time.Minute
+		baseBackoff = 250 * time.Millisecond
+		quarantineAfter = 12
+		quarantinePeriod = 45 * time.Second
 	}
 
 	// Exponential backoff.
@@ -847,19 +990,19 @@ func scorePeer(st *peerStat) float64 {
 	if st == nil {
 		return 0
 	}
-	score := 1.0 + float64(st.successes)*1.25 - float64(st.failures)*0.9
+	score := 1.0 + float64(st.successes)*1.5 - float64(st.failures)*0.35
 	if st.latencyN > 0 {
 		avg := st.latencySum / time.Duration(st.latencyN)
-		score -= avg.Seconds() * 0.35
+		score -= avg.Seconds() * 0.12
 	}
 	if time.Since(st.lastFailure) < 8*time.Second {
-		score -= 2
+		score -= 0.75
 	}
 	if time.Now().Before(st.quarantinedUntil) {
 		score -= 100
 	}
 	if time.Now().Before(st.backoffUntil) {
-		score -= 10
+		score -= 4
 	}
 	return score
 }
@@ -906,6 +1049,9 @@ func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte
 	if err != nil {
 		return nil, err
 	}
+	// Guard the entire setup phase (handshake + unchoke wait) with a deadline
+	// so stalling peers don't hold connector goroutines indefinitely.
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 
 	_, supportsExt, err := protocol.HandshakeExtended(conn, torrent.InfoHash, peerID)
 	if err != nil {
@@ -918,7 +1064,7 @@ func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte
 		return nil, fmt.Errorf("send interested: %w", err)
 	}
 
-	sess := &peerSession{peer: peer, conn: conn}
+	sess := &peerSession{peer: peer, conn: conn, inflight: defaultInflightPeer}
 	if supportsExt {
 		type extHandshake struct {
 			M map[string]int64 `bencode:"m"`
@@ -949,14 +1095,8 @@ func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte
 				continue
 			}
 			if msg.Payload[0] == 0 {
-				type extHandshake struct {
-					M map[string]int64 `bencode:"m"`
-				}
-				var hs extHandshake
-				if err := bencode.Unmarshal(strings.NewReader(string(msg.Payload[1:])), &hs); err == nil {
-					if v, ok := hs.M["ut_pex"]; ok && v > 0 && v < 256 {
-						sess.utPexID = int(v)
-					}
+				if pexID, ok := parseUtPexIDFromExtendedHandshake(msg.Payload[1:]); ok {
+					sess.utPexID = pexID
 				}
 			} else if sess.utPexID > 0 && int(msg.Payload[0]) == sess.utPexID {
 				for _, p := range parseUtPexPeers(msg.Payload[1:]) {
@@ -965,6 +1105,7 @@ func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte
 			}
 		case protocol.MsgUnchoke:
 			sess.unchoked = true
+			_ = conn.SetDeadline(time.Time{}) // clear setup deadline; download manages its own
 			return sess, nil
 		case protocol.MsgChoke:
 			conn.Close() //nolint:errcheck
@@ -976,6 +1117,7 @@ func newPeerSession(peer types.Peer, torrent *types.TorrentFile, peerID [20]byte
 		conn.Close() //nolint:errcheck
 		return nil, fmt.Errorf("peer did not unchoke")
 	}
+	_ = conn.SetDeadline(time.Time{}) // clear setup deadline; download manages its own
 	return sess, nil
 }
 
@@ -983,6 +1125,9 @@ func downloadPieceFromSession(sess *peerSession, torrent *types.TorrentFile, pie
 	if len(sess.bitfield) > 0 && !bitfieldHasPiece(sess.bitfield, pieceIdx) {
 		return nil, errPeerMissingPiece
 	}
+
+	// Arm the read deadline before the first network operation.
+	_ = sess.conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	pieceSize := pieceLengthAt(torrent, pieceIdx)
 	pieceData := make([]byte, pieceSize)
@@ -1007,7 +1152,14 @@ func downloadPieceFromSession(sess *peerSession, torrent *types.TorrentFile, pie
 		default:
 		}
 
-		for len(inflight) < 5 && int(nextBegin) < pieceSize {
+		limit := sess.inflight
+		if limit < minInflightPerPeer {
+			limit = minInflightPerPeer
+		}
+		if limit > maxInflightPerPeer {
+			limit = maxInflightPerPeer
+		}
+		for len(inflight) < limit && int(nextBegin) < pieceSize {
 			blockLen := blockSize
 			if int(nextBegin)+blockLen > pieceSize {
 				blockLen = pieceSize - int(nextBegin)
@@ -1076,6 +1228,46 @@ func downloadPieceFromSession(sess *peerSession, torrent *types.TorrentFile, pie
 	}
 
 	return pieceData, nil
+}
+
+func tuneInflightOnSuccess(sess *peerSession, latency time.Duration) {
+	if sess == nil {
+		return
+	}
+	if latency <= 8*time.Second {
+		if sess.inflight < maxInflightPerPeer {
+			sess.inflight++
+		}
+		return
+	}
+	if latency >= 30*time.Second {
+		if sess.inflight > minInflightPerPeer {
+			sess.inflight--
+		}
+	}
+}
+
+func tuneInflightOnFailure(sess *peerSession, class FailureClass) {
+	if sess == nil {
+		return
+	}
+	switch class {
+	case FailClassTimeout, FailClassProtocol, FailClassHashMismatch:
+		if sess.inflight > minInflightPerPeer {
+			sess.inflight -= 2
+		}
+	case FailClassChoked:
+		if sess.inflight > minInflightPerPeer {
+			sess.inflight--
+		}
+	default:
+		if sess.inflight > minInflightPerPeer {
+			sess.inflight--
+		}
+	}
+	if sess.inflight < minInflightPerPeer {
+		sess.inflight = minInflightPerPeer
+	}
 }
 
 // downloadPieceFromPeer downloads a specific piece from a peer.
@@ -1334,6 +1526,41 @@ func pieceOffset(torrent *types.TorrentFile, pieceIdx int) int64 {
 	return int64(pieceIdx) * torrent.Info.PieceLength
 }
 
+func formatBytes(value int64) string {
+	if value < 1024 {
+		return fmt.Sprintf("%d B", value)
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	scaled := float64(value)
+	unit := 0
+	for scaled >= 1024 && unit < len(units)-1 {
+		scaled /= 1024
+		unit++
+	}
+	return fmt.Sprintf("%.1f %s", scaled, units[unit])
+}
+
+func formatRate(bytesPerSecond float64) string {
+	if bytesPerSecond <= 0 {
+		return "0 B/s"
+	}
+	return formatBytes(int64(bytesPerSecond)) + "/s"
+}
+
+func formatETA(duration time.Duration) string {
+	if duration < time.Minute {
+		return duration.Truncate(time.Second).String()
+	}
+	if duration < time.Hour {
+		minutes := int(duration.Minutes())
+		seconds := int(duration.Seconds()) % 60
+		return fmt.Sprintf("%dm%02ds", minutes, seconds)
+	}
+	hours := int(duration.Hours())
+	minutes := int(duration.Minutes()) % 60
+	return fmt.Sprintf("%dh%02dm", hours, minutes)
+}
+
 func writePiece(file *os.File, torrent *types.TorrentFile, pieceIdx int, pieceData []byte) error {
 	if len(pieceData) != pieceLengthAt(torrent, pieceIdx) {
 		return fmt.Errorf("piece %d invalid size: got %d", pieceIdx, len(pieceData))
@@ -1524,14 +1751,19 @@ func setBitfieldPiece(bitfield *[]byte, pieceIdx int) {
 }
 
 func parseUtPexPeers(payload []byte) []types.Peer {
-	type utPexMessage struct {
-		Added string `bencode:"added"`
-	}
-	var msg utPexMessage
-	if err := bencode.Unmarshal(strings.NewReader(string(payload)), &msg); err != nil {
+	value, _, err := decodeBencodeValueDL(payload)
+	if err != nil {
 		return nil
 	}
-	data := []byte(msg.Added)
+	msg, ok := value.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	added, ok := msg["added"].(string)
+	if !ok || added == "" {
+		return nil
+	}
+	data := []byte(added)
 	if len(data) < 6 {
 		return nil
 	}
@@ -1545,6 +1777,105 @@ func parseUtPexPeers(payload []byte) []types.Peer {
 		peers = append(peers, types.Peer{IP: ip, Port: port})
 	}
 	return peers
+}
+
+func parseUtPexIDFromExtendedHandshake(payload []byte) (int, bool) {
+	value, _, err := decodeBencodeValueDL(payload)
+	if err != nil {
+		return 0, false
+	}
+	hs, ok := value.(map[string]interface{})
+	if !ok {
+		return 0, false
+	}
+	m, ok := hs["m"].(map[string]interface{})
+	if !ok {
+		return 0, false
+	}
+	v, ok := m["ut_pex"].(int64)
+	if !ok || v <= 0 || v >= 256 {
+		return 0, false
+	}
+	return int(v), true
+}
+
+func decodeBencodeValueDL(data []byte) (interface{}, int, error) {
+	if len(data) == 0 {
+		return nil, 0, fmt.Errorf("empty bencode data")
+	}
+
+	switch data[0] {
+	case 'i':
+		end := strings.IndexByte(string(data), 'e')
+		if end == -1 {
+			return nil, 0, fmt.Errorf("unterminated integer")
+		}
+		var value int64
+		if _, err := fmt.Sscanf(string(data[1:end]), "%d", &value); err != nil {
+			return nil, 0, fmt.Errorf("parse integer: %w", err)
+		}
+		return value, end + 1, nil
+	case 'l':
+		items := make([]interface{}, 0)
+		pos := 1
+		for pos < len(data) && data[pos] != 'e' {
+			item, n, err := decodeBencodeValueDL(data[pos:])
+			if err != nil {
+				return nil, 0, err
+			}
+			items = append(items, item)
+			pos += n
+		}
+		if pos >= len(data) || data[pos] != 'e' {
+			return nil, 0, fmt.Errorf("unterminated list")
+		}
+		return items, pos + 1, nil
+	case 'd':
+		items := make(map[string]interface{})
+		pos := 1
+		for pos < len(data) && data[pos] != 'e' {
+			keyValue, n, err := decodeBencodeValueDL(data[pos:])
+			if err != nil {
+				return nil, 0, err
+			}
+			key, ok := keyValue.(string)
+			if !ok {
+				return nil, 0, fmt.Errorf("dictionary key is not a string")
+			}
+			pos += n
+			value, n, err := decodeBencodeValueDL(data[pos:])
+			if err != nil {
+				return nil, 0, err
+			}
+			items[key] = value
+			pos += n
+		}
+		if pos >= len(data) || data[pos] != 'e' {
+			return nil, 0, fmt.Errorf("unterminated dictionary")
+		}
+		return items, pos + 1, nil
+	default:
+		if data[0] < '0' || data[0] > '9' {
+			return nil, 0, fmt.Errorf("unexpected bencode token %q", data[0])
+		}
+		colon := strings.IndexByte(string(data), ':')
+		if colon == -1 {
+			return nil, 0, fmt.Errorf("string length missing colon")
+		}
+		length := 0
+		for _, ch := range data[:colon] {
+			if ch < '0' || ch > '9' {
+				return nil, 0, fmt.Errorf("invalid string length")
+			}
+			length = length*10 + int(ch-'0')
+		}
+		start := colon + 1
+		end := start + length
+		if end > len(data) {
+			return nil, 0, fmt.Errorf("string data truncated")
+		}
+		return string(data[start:end]), end, nil
+	}
 }
 
 func discoveryLoop(ctx context.Context, torrent *types.TorrentFile, trackers []string, peerID [20]byte, listenPort uint16, addPeer func(types.Peer)) {

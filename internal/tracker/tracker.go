@@ -42,6 +42,15 @@ type httpTrackerResponseList struct {
 	Peers         []httpTrackerPeer `bencode:"peers"`
 }
 
+// EnableLogs controls whether tracker announce helpers print per-tracker details.
+var EnableLogs bool
+
+func trackerLogf(format string, args ...interface{}) {
+	if EnableLogs {
+		fmt.Printf(format, args...)
+	}
+}
+
 func udpEventCode(event string) uint32 {
 	switch event {
 	case "completed":
@@ -157,7 +166,7 @@ func AnnounceUDPWithRequest(trackerURL string, req AnnounceRequest) ([]types.Pee
 	}
 	// bytes 8-11: interval   12-15: leechers   16-19: seeders
 	peers := ParsePeersCompact(announceResp[20:n])
-	fmt.Printf("UDP tracker %s: %d peers\n", host, len(peers))
+	trackerLogf("UDP tracker %s: %d peers\n", host, len(peers))
 	return peers, nil
 }
 
@@ -244,7 +253,7 @@ func AnnounceToHTTPTrackerWithRequest(torrent *types.TorrentFile, req AnnounceRe
 		}
 	}
 
-	fmt.Printf("Tracker returned %d peers\n", len(peers))
+	trackerLogf("Tracker returned %d peers\n", len(peers))
 	return peers, nil
 }
 
@@ -265,7 +274,7 @@ func ParsePeersCompact(data []byte) []types.Peer {
 		peers = append(peers, types.Peer{IP: ip, Port: port})
 	}
 
-	fmt.Printf("Parsed %d peers from compact format\n", len(peers))
+	trackerLogf("Parsed %d peers from compact format\n", len(peers))
 	return peers
 }
 
