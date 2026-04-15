@@ -197,7 +197,7 @@ Notes:
 # Magnet with UDP tracker (most common)
 ./bin/torrent-client "magnet:?xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD&tr=udp://tracker.opentrackr.org:1337/announce"
 
-# Bare magnet (no trackers — uses DHT automatically)
+# Bare magnet (public UDP tracker fallback + DHT)
 ./bin/torrent-client "magnet:?xt=urn:btih:AABBCCDDEEFF00112233445566778899AABBCCDD"
 
 # Magnet with peer hints (x.pe)
@@ -207,9 +207,10 @@ Notes:
 **What happens (extra steps vs .torrent):**
 
 - If trackers are listed: contacts all of them (HTTP + UDP)
+- If no trackers are listed: seeds discovery with the built-in public UDP tracker fallback list before falling back to DHT
 - If `x.pe` peer hints are present: seeds those peers immediately
 - If no trackers, or fewer than 5 peers found: runs a DHT (BEP 5) Kademlia lookup against public bootstrap nodes to find peers
-- Once peers are found: fetches the full torrent metadata from the swarm using BEP 9 (`ut_metadata`) and verifies it against the info hash
+- Once peers are found: fetches the full torrent metadata from the swarm using BEP 9 (`ut_metadata`) with parallel peer probes and verifies it against the info hash
 - If fetched metadata marks the torrent as private (`private=1`): DHT is disabled for the download phase
 - Then proceeds identically to a .torrent file download
 

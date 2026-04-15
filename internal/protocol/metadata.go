@@ -2,10 +2,13 @@ package protocol
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"fmt"
 	"io"
 	"net"
+	"strings"
+	"sync"
 	"time"
 
 	bencode "github.com/jackpal/bencode-go"
@@ -197,21 +200,95 @@ func FetchMetadataFromPeers(peers []types.Peer, infoHash [20]byte, peerID [20]by
 	if len(peers) == 0 {
 		return nil, fmt.Errorf("no peers to fetch metadata from")
 	}
-	for _, peer := range peers {
-		addr := net.JoinHostPort(peer.IP.String(), fmt.Sprintf("%d", peer.Port))
-		conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
-		if err != nil {
-			continue
-		}
-		info, err := FetchMetadata(conn, infoHash, peerID)
-		conn.Close()
-		if err == nil {
-			fmt.Printf("Fetched metadata from %s\n", addr)
-			return info, nil
-		}
-		fmt.Printf("Metadata from %s: %v\n", addr, err)
+
+	const maxConcurrentPeers = 8
+	type result struct {
+		info *types.TorrentInfo
+		err  error
 	}
-	return nil, fmt.Errorf("failed to fetch metadata from any of %d peers", len(peers))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	peerCh := make(chan types.Peer)
+	resultCh := make(chan result, len(peers))
+	workerCount := maxConcurrentPeers
+	if len(peers) < workerCount {
+		workerCount = len(peers)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case peer, ok := <-peerCh:
+					if !ok {
+						return
+					}
+
+					addr := net.JoinHostPort(peer.IP.String(), fmt.Sprintf("%d", peer.Port))
+					dialer := net.Dialer{Timeout: 10 * time.Second}
+					conn, err := dialer.DialContext(ctx, "tcp", addr)
+					if err != nil {
+						select {
+						case resultCh <- result{err: fmt.Errorf("%s: dial: %w", addr, err)}:
+						case <-ctx.Done():
+						}
+						continue
+					}
+
+					info, err := FetchMetadata(conn, infoHash, peerID)
+					_ = conn.Close()
+					if err == nil {
+						select {
+						case resultCh <- result{info: info}:
+						case <-ctx.Done():
+						}
+						return
+					}
+
+					select {
+					case resultCh <- result{err: fmt.Errorf("%s: %w", addr, err)}:
+					case <-ctx.Done():
+					}
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(peerCh)
+		for _, peer := range peers {
+			select {
+			case <-ctx.Done():
+				return
+			case peerCh <- peer:
+			}
+		}
+	}()
+
+	var errSummaries []string
+	for i := 0; i < len(peers); i++ {
+		res := <-resultCh
+		if res.err == nil {
+			cancel()
+			return res.info, nil
+		}
+		if len(errSummaries) < 5 {
+			errSummaries = append(errSummaries, res.err.Error())
+		}
+	}
+
+	wg.Wait()
+	if len(errSummaries) == 0 {
+		return nil, fmt.Errorf("failed to fetch metadata from any of %d peers", len(peers))
+	}
+	return nil, fmt.Errorf("failed to fetch metadata from any of %d peers: %s", len(peers), strings.Join(errSummaries, "; "))
 }
 
 // decodeInfoDict parses a raw bencoded info-dictionary into a TorrentInfo.

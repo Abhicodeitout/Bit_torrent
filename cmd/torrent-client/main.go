@@ -126,7 +126,7 @@ func main() {
 
 		// Minimal struct used only for tracker HTTP announces (needs InfoHash).
 		torrentFile = &types.TorrentFile{InfoHash: magnet.InfoHash}
-		trackerURLs = magnet.Trackers
+		trackerURLs = buildTrackerURLList(magnet.Trackers, true)
 
 		peers = gatherPeers(magnet.InfoHash, trackerURLs, torrentFile, peerID, opts.ListenPort, "started")
 		if len(magnet.PeerAddrs) > 0 {
@@ -318,9 +318,7 @@ func main() {
 	)
 }
 
-// buildTrackerList returns a deduplicated, flat list of all tracker URLs from a
-// TorrentFile (Announce + every tier of AnnounceList).
-func buildTrackerList(tf *types.TorrentFile) []string {
+func buildTrackerURLList(trackers []string, includePublicFallback bool) []string {
 	seen := make(map[string]struct{})
 	var list []string
 	add := func(u string) {
@@ -332,18 +330,25 @@ func buildTrackerList(tf *types.TorrentFile) []string {
 			}
 		}
 	}
-	add(tf.Announce)
-	for _, tier := range tf.AnnounceList {
-		for _, u := range tier {
-			add(u)
-		}
+	for _, tr := range trackers {
+		add(tr)
 	}
-	if !tf.Info.Private {
+	if includePublicFallback {
 		for _, tr := range publicTrackerFallback {
 			add(tr)
 		}
 	}
 	return list
+}
+
+// buildTrackerList returns a deduplicated, flat list of all tracker URLs from a
+// TorrentFile (Announce + every tier of AnnounceList).
+func buildTrackerList(tf *types.TorrentFile) []string {
+	trackers := []string{tf.Announce}
+	for _, tier := range tf.AnnounceList {
+		trackers = append(trackers, tier...)
+	}
+	return buildTrackerURLList(trackers, !tf.Info.Private)
 }
 
 // gatherPeers contacts every tracker URL in order, collecting peers from each
